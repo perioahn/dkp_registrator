@@ -1,11 +1,19 @@
-name: Build macOS App
+name: Build App
 
 on:
   workflow_dispatch:  # 수동 실행
 
 jobs:
   build:
-    runs-on: macos-14  # Apple Silicon (M1+)
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS
+          - os: windows-latest
+            name: Windows
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -24,15 +32,11 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onedir --windowed \
-            --name "DKPregistrator" \
-            --icon app_icon.ico \
-            --noconfirm \
-            main_gui.py
+          pyinstaller --onedir --windowed --name "DKPregistrator" --icon app_icon.ico --noconfirm main_gui.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DKPregistrator-macOS
+          name: DKPregistrator-${{ matrix.name }}
           path: dist/DKPregistrator/
           retention-days: 30
