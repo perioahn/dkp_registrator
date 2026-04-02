@@ -1,0 +1,8 @@
+torch
+torchvision
+kornia
+opencv-python-headless
+numpy
+Pillow
+matplotlib
+scikit-image
