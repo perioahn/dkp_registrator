@@ -1,11 +1,12 @@
-"""
-preprocess.py — Phase A: 이미지 전처리 (CLAHE, 회전, 크롭, 리사이즈)
+"""Phase A: 이미지 전처리 (CLAHE, 회전, 크롭, 리사이즈).
 
 GUI 의존성 없음. numpy, cv2만 사용.
 """
 
-import numpy as np
+from __future__ import annotations
+
 import cv2
+import numpy as np
 
 
 def apply_clahe(img_gray: np.ndarray,
@@ -19,7 +20,8 @@ def apply_clahe(img_gray: np.ndarray,
 
 def rotate_with_matrix(image: np.ndarray,
                         angle_deg: float,
-                        center: tuple = None):
+                        center: tuple | None = None
+                        ) -> tuple[np.ndarray, np.ndarray]:
     """
     잘림 없는 회전 + 3×3 변환 행렬 반환.
 
@@ -57,9 +59,10 @@ def rotate_with_matrix(image: np.ndarray,
     return rotated, M_3x3
 
 
-def auto_orient_and_crop(image: np.ndarray,
-                          mask: np.ndarray,
-                          padding_ratio: float = 0.1):
+def auto_orient_and_crop(
+        image: np.ndarray, mask: np.ndarray,
+        padding_ratio: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
     """
     SAM2 마스크 기반 자동 회전보정 + 크롭.
 
@@ -122,12 +125,16 @@ def auto_orient_and_crop(image: np.ndarray,
     return cropped_img, cropped_mask, M_rot, crop_offset
 
 
-def resize_to_max(img: np.ndarray, max_side: int = 640):
-    """
-    장변 기준 리사이즈. LoFTR 입력 해상도 일관성 보장.
+def resize_to_max(img: np.ndarray,
+                  max_side: int = 640) -> tuple[np.ndarray, float]:
+    """장변 기준 리사이즈.
+
+    Args:
+        img: 입력 이미지.
+        max_side: 최대 변 길이.
 
     Returns:
-        resized_img, scale_factor
+        (리사이즈된 이미지, 스케일 팩터) 튜플.
     """
     h, w = img.shape[:2]
     long_side = max(h, w)

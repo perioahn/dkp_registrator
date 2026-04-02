@@ -1,16 +1,20 @@
-"""
-register.py -- 파이프라인 오케스트레이터 (Phase A~D 통합)
+"""파이프라인 오케스트레이터 (Phase A~D 통합).
 
 GUI 의존성 없음. tkinter import 금지.
 """
 
+from __future__ import annotations
+
 import numpy as np
 import cv2
 
+from matching import apply_soft_mask, filter_by_mask, loftr_match
 from preprocess import apply_clahe, auto_orient_and_crop, resize_to_max
-from matching import loftr_match, filter_by_mask, apply_soft_mask
-from transform import compose_full_matrix, quality_gate_similarity, quality_gate_affine
-from refine import refine_similarity_delta
+from transform import (
+    compose_full_matrix,
+    quality_gate_affine,
+    quality_gate_similarity,
+)
 
 # 탐색 파라미터 레벨
 CONF_LEVELS = (0.3, 0.2, 0.15, 0.1)
@@ -23,14 +27,25 @@ def register_pair(fixed_img: np.ndarray,
                   moving_img: np.ndarray,
                   fixed_mask: np.ndarray,
                   moving_mask: np.ndarray,
-                  refine: bool = True,
+                  refine: bool = False,
                   force_nocrop: bool = False,
-                  hint: tuple = None) -> dict:
-    """
-    전체 정합 파이프라인.
+                  hint: tuple | None = None) -> dict:
+    """전체 정합 파이프라인.
 
     hint=(conf, max_side, clahe_clip, mask_sigma) 제공 시 최우선 시도.
     hint 미제공 시 기본 cascade: CLAHE=2.0, sigma=5, conf×max_side 순회.
+
+    Args:
+        fixed_img: 고정상 RGB 배열.
+        moving_img: 이동상 RGB 배열.
+        fixed_mask: 고정상 마스크 uint8.
+        moving_mask: 이동상 마스크 uint8.
+        refine: 미사용 (하위호환).
+        force_nocrop: True이면 크롭 전처리 건너뛰기.
+        hint: (conf, max_side[, clahe_clip, mask_sigma]) 튜플.
+
+    Returns:
+        정합 결과 딕셔너리.
     """
     debug = {}
 
@@ -329,33 +344,6 @@ def register_pair(fixed_img: np.ndarray,
             (fixed_img.shape[1], fixed_img.shape[0])
         )
 
-        # === Phase E: Lightweight Refinement ===
-        if refine:
-            print("[INFO] Phase E: SimpleITK refinement 시작...")
-            try:
-                M_refined = refine_similarity_delta(
-                    fixed_img, moving_img, fixed_mask, M_full,
-                    n_iter=25
-                )
-                if M_refined is not None:
-                    dx = M_refined[0, 2] - M_full[0, 2]
-                    dy = M_refined[1, 2] - M_full[1, 2]
-                    print(f"[INFO] Phase E 완료: delta_tx={dx:.2f}, delta_ty={dy:.2f}")
-                    M_full = M_refined
-                    registered = cv2.warpAffine(
-                        moving_img, M_full[:2, :],
-                        (fixed_img.shape[1], fixed_img.shape[0])
-                    )
-                    final_metrics['refined'] = True
-                else:
-                    print("[INFO] Phase E: 건너뜀 (SimpleITK 미사용 또는 ROI 부족)")
-                    final_metrics['refined'] = False
-            except Exception as e:
-                print(f"[WARN] Phase E refinement failed: {e}")
-                final_metrics['refined'] = False
-        else:
-            final_metrics['refined'] = False
-
         debug['false_color'] = false_color(fixed_img, registered)
 
         return {
@@ -372,101 +360,21 @@ def register_pair(fixed_img: np.ndarray,
     }
 
 
-def match_check(fixed_img, moving_img, fixed_mask, moving_mask):
-    """
-    10×8 매칭 비교 (conf × CLAHE × max_side × sigma = 80 combos).
+def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
+                  fixed_mask: np.ndarray,
+                  moving_mask: np.ndarray) -> list[dict]:
+    """정합 테스트 (conf × CLAHE × max_side × sigma combos).
 
-    LoFTR는 (CLAHE × max_side × sigma)별 1회만 실행 (총 16회).
+    LoFTR 캐싱. 각 조합에 gate check + warp 수행.
 
-    Returns:
-        list of 80 dicts (순서: conf > clahe > ms > sigma → 10×8 grid)
-    """
-    # 전처리 (crop 시도)
-    crop_ok = False
-    try:
-        fc, fmc, _, _ = auto_orient_and_crop(fixed_img, fixed_mask)
-        mc, mmc, _, _ = auto_orient_and_crop(moving_img, moving_mask)
-        crop_ok = True
-        print("[Match Check] Crop 전처리 완료")
-    except Exception as e:
-        print(f"[Match Check] Crop 실패: {e}, no-crop 사용")
-        fc, mc = fixed_img, moving_img
-        fmc, mmc = fixed_mask, moving_mask
-
-    fc_gray = cv2.cvtColor(fc, cv2.COLOR_RGB2GRAY) if len(fc.shape) == 3 else fc
-    mc_gray = cv2.cvtColor(mc, cv2.COLOR_RGB2GRAY) if len(mc.shape) == 3 else mc
-
-    # CLAHE별 grayscale
-    clahe_imgs = {}
-    for clip in CLAHE_CLIPS:
-        clahe_imgs[clip] = (
-            apply_clahe(fc_gray, clip_limit=clip),
-            apply_clahe(mc_gray, clip_limit=clip))
-
-    # (CLAHE × max_side × sigma)별 LoFTR 1회 (conf=0.1)
-    raw_cache = {}
-    run_count = 0
-    for clip in CLAHE_CLIPS:
-        fg, mg = clahe_imgs[clip]
-        for ms in MAX_SIDES:
-            fr, _ = resize_to_max(fg, ms)
-            mr, _ = resize_to_max(mg, ms)
-            fm = cv2.resize(fmc, (fr.shape[1], fr.shape[0]),
-                            interpolation=cv2.INTER_NEAREST)
-            mm = cv2.resize(mmc, (mr.shape[1], mr.shape[0]),
-                            interpolation=cv2.INTER_NEAREST)
-            for sig in MASK_SIGMAS:
-                f_masked = apply_soft_mask(fr, fm, sigma=sig)
-                m_masked = apply_soft_mask(mr, mm, sigma=sig)
-
-                k0, k1, cf = loftr_match(f_masked, m_masked, conf_threshold=0.1)
-                k0, k1, cf = filter_by_mask(k0, k1, cf, fm, mm)
-                run_count += 1
-
-                raw_cache[(clip, ms, sig)] = {
-                    'fixed_img': fr, 'moving_img': mr,
-                    'kpts0': k0, 'kpts1': k1, 'conf': cf,
-                }
-                print(f"[Match Check] LoFTR {run_count}/16 "
-                      f"(clahe={clip} ms={ms} σ={sig}): {len(k0)} matches")
-
-    # conf별 필터링 → 80 results
-    # 순서: conf > clahe > ms > sigma → row=conf*2+clahe, col=ms*2+sigma
-    results = []
-    for conf_t in CONF_LEVELS:
-        for clip in CLAHE_CLIPS:
-            for ms in MAX_SIDES:
-                for sig in MASK_SIGMAS:
-                    raw = raw_cache[(clip, ms, sig)]
-                    mask = raw['conf'] > conf_t
-                    k0 = raw['kpts0'][mask]
-                    k1 = raw['kpts1'][mask]
-                    cf = raw['conf'][mask]
-
-                    results.append({
-                        'conf_threshold': conf_t,
-                        'max_side': ms,
-                        'clahe_clip': clip,
-                        'mask_sigma': sig,
-                        'fixed_img': raw['fixed_img'],
-                        'moving_img': raw['moving_img'],
-                        'kpts0': k0, 'kpts1': k1, 'conf': cf,
-                        'n_matches': len(k0),
-                        'mean_conf': float(np.mean(cf)) if len(cf) > 0 else 0.0,
-                        'crop_used': crop_ok,
-                    })
-
-    return results
-
-
-def register_test(fixed_img, moving_img, fixed_mask, moving_mask):
-    """
-    10×8 정합 테스트 (conf × CLAHE × max_side × sigma = 80 combos).
-
-    LoFTR는 16회만 실행. 각 조합에 gate check + warp 수행. Refinement 미적용.
+    Args:
+        fixed_img: 고정상 RGB 배열.
+        moving_img: 이동상 RGB 배열.
+        fixed_mask: 고정상 마스크 uint8.
+        moving_mask: 이동상 마스크 uint8.
 
     Returns:
-        list of 80 dicts (순서: conf > clahe > ms > sigma → 10×8 grid)
+        결과 딕셔너리 리스트.
     """
     _MIN_FOR_ESTIMATE = 4
 
@@ -571,7 +479,7 @@ def register_test(fixed_img, moving_img, fixed_mask, moving_mask):
                                     (fixed_img.shape[1], fixed_img.shape[0]))
                                 entry.update(
                                     status=status, gate='similarity',
-                                    metrics=metrics,
+                                    metrics=metrics, M_full=M_full,
                                     registered_img=reg,
                                     false_color=false_color(fixed_img, reg))
                                 passed = True
@@ -596,7 +504,7 @@ def register_test(fixed_img, moving_img, fixed_mask, moving_mask):
                                         (fixed_img.shape[1], fixed_img.shape[0]))
                                     entry.update(
                                         status=status, gate='affine',
-                                        metrics=metrics,
+                                        metrics=metrics, M_full=M_full,
                                         registered_img=reg,
                                         false_color=false_color(fixed_img, reg))
                                     passed = True
@@ -614,8 +522,16 @@ def register_test(fixed_img, moving_img, fixed_mask, moving_mask):
     return results
 
 
-def false_color(img1, img2):
-    """정합 결과 시각화 -- 기존 false_color() 재활용."""
+def false_color(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
+    """정합 결과 false color 시각화.
+
+    Args:
+        img1: 기준 이미지 (RGB 또는 grayscale).
+        img2: 정합된 이미지 (RGB 또는 grayscale).
+
+    Returns:
+        False color RGB 배열.
+    """
     img1 = img1.copy()
     img2 = img2.copy()
     if img1.max() <= 1:

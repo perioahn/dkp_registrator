@@ -10,7 +10,12 @@ import numpy as np
 import cv2
 
 from preprocess import apply_clahe
-import legacy_of
+
+try:
+    import legacy_of
+    _LEGACY_AVAILABLE = True
+except ImportError:
+    _LEGACY_AVAILABLE = False
 
 # ROI가 이 크기 이하면 refinement 건너뜀
 _MIN_ROI_SIDE = 30
@@ -30,7 +35,7 @@ def refine_similarity_delta(fixed_img, moving_img, fixed_mask,
     Returns:
         M_refined (3x3) 또는 None (SimpleITK 없거나 실패)
     """
-    if not legacy_of.LEGACY_AVAILABLE:
+    if not _LEGACY_AVAILABLE:
         return None
 
     h, w = fixed_img.shape[:2]

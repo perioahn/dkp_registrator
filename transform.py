@@ -1,11 +1,12 @@
-"""
-transform.py — Phase C: 변환 행렬 합성 + 품질 게이트
+"""Phase C: 변환 행렬 합성 + 품질 게이트.
 
 GUI 의존성 없음. numpy, cv2만 사용.
 """
 
-import numpy as np
+from __future__ import annotations
+
 import cv2
+import numpy as np
 
 
 def compose_full_matrix(M_loftr_2x3: np.ndarray,
@@ -57,16 +58,21 @@ def compose_full_matrix(M_loftr_2x3: np.ndarray,
     return M_full
 
 
-def quality_gate_similarity(kpts_f: np.ndarray,
-                             kpts_m: np.ndarray,
-                             M_2x3: np.ndarray,
-                             inliers: np.ndarray,
-                             tooth_mask_area: float):
-    """
-    Similarity 변환 품질 판정 (pass/warn/fail).
+def quality_gate_similarity(
+        kpts_f: np.ndarray, kpts_m: np.ndarray,
+        M_2x3: np.ndarray, inliers: np.ndarray,
+        tooth_mask_area: float) -> tuple[str, dict]:
+    """Similarity 변환 품질 판정 (pass/warn/fail).
+
+    Args:
+        kpts_f: Fixed 키포인트 (N×2).
+        kpts_m: Moving 키포인트 (N×2).
+        M_2x3: Similarity 변환 행렬 (2×3).
+        inliers: RANSAC inlier 마스크.
+        tooth_mask_area: 치아 마스크 면적.
 
     Returns:
-        status ('pass'/'warn'/'fail'), metrics dict
+        (status, metrics) 튜플.
     """
     n_total = len(kpts_f)
     if inliers is None:
@@ -141,16 +147,21 @@ def quality_gate_similarity(kpts_f: np.ndarray,
     return 'pass', metrics
 
 
-def quality_gate_affine(kpts_f: np.ndarray,
-                         kpts_m: np.ndarray,
-                         M_2x3: np.ndarray,
-                         inliers: np.ndarray,
-                         tooth_mask_area: float):
-    """
-    Affine 변환 품질 판정. scale/rotation 체크 없음.
+def quality_gate_affine(
+        kpts_f: np.ndarray, kpts_m: np.ndarray,
+        M_2x3: np.ndarray, inliers: np.ndarray,
+        tooth_mask_area: float) -> tuple[str, dict]:
+    """Affine 변환 품질 판정. scale/rotation 체크 없음.
+
+    Args:
+        kpts_f: Fixed 키포인트 (N×2).
+        kpts_m: Moving 키포인트 (N×2).
+        M_2x3: Affine 변환 행렬 (2×3).
+        inliers: RANSAC inlier 마스크.
+        tooth_mask_area: 치아 마스크 면적.
 
     Returns:
-        status ('pass'/'warn'/'fail'), metrics dict
+        (status, metrics) 튜플.
     """
     n_total = len(kpts_f)
     if inliers is None:
