@@ -1,0 +1,38 @@
+name: Build macOS App
+
+on:
+  workflow_dispatch:  # 수동 실행
+
+jobs:
+  build:
+    runs-on: macos-14  # Apple Silicon (M1+)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onedir --windowed \
+            --name "DKPregistrator" \
+            --icon app_icon.ico \
+            --noconfirm \
+            main_gui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DKPregistrator-macOS
+          path: dist/DKPregistrator/
+          retention-days: 30
