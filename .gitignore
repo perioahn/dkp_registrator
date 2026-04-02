@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Images (test/debug)
+*.jpg
+*.png
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Misc
+*.log

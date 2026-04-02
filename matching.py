@@ -46,11 +46,22 @@ def loftr_match(img1_gray: np.ndarray,
 
     input1 = torch.from_numpy(img1_gray).float()[None, None] / 255.0
     input2 = torch.from_numpy(img2_gray).float()[None, None] / 255.0
-    input1 = input1.to(device)
-    input2 = input2.to(device)
 
-    with torch.no_grad():
-        correspondences = model({"image0": input1, "image1": input2})
+    try:
+        input1 = input1.to(device)
+        input2 = input2.to(device)
+        with torch.no_grad():
+            correspondences = model({"image0": input1, "image1": input2})
+    except torch.cuda.OutOfMemoryError:
+        print("[WARN] CUDA OOM - CPU fallback")
+        torch.cuda.empty_cache()
+        model_cpu = model.cpu()
+        with torch.no_grad():
+            correspondences = model_cpu({"image0": input1.cpu(), "image1": input2.cpu()})
+        try:
+            model.to(device)  # 원복
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            pass  # GPU 복귀 실패 — 다음 호출 시 CPU로 계속
 
     kpts0 = correspondences['keypoints0'].cpu().numpy()
     kpts1 = correspondences['keypoints1'].cpu().numpy()
@@ -58,6 +69,30 @@ def loftr_match(img1_gray: np.ndarray,
 
     valid = conf > conf_threshold
     return kpts0[valid], kpts1[valid], conf[valid]
+
+
+def apply_soft_mask(img_gray: np.ndarray,
+                    mask: np.ndarray,
+                    sigma: int = 5,
+                    fill: int = 127) -> np.ndarray:
+    """
+    LoFTR 입력 전 소프트 마스크 적용. 배경을 균일 gray로 채워
+    LoFTR attention이 치아 영역에 집중하도록 유도.
+
+    Args:
+        img_gray: grayscale uint8
+        mask: binary mask uint8 (0 or 255)
+        sigma: Gaussian blur sigma
+        fill: 배경 채움값
+
+    Returns:
+        masked grayscale uint8
+    """
+    ksize = int(2 * np.ceil(3 * sigma) + 1) | 1
+    soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0,
+                              (ksize, ksize), sigma)
+    result = img_gray.astype(np.float32) * soft + fill * (1.0 - soft)
+    return result.astype(np.uint8)
 
 
 def filter_by_mask(kpts0: np.ndarray,
