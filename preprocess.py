@@ -82,6 +82,8 @@ def auto_orient_and_crop(image: np.ndarray,
 
     # 180도 모호성 제거: [-90, 90) 범위로 정규화
     # 직사각형은 180도 회전 대칭이므로 동일 형상이 0도 또는 180도로 반환될 수 있음
+    # 제한: 실제 치아 배열이 정확히 ±90도에 걸칠 경우 불안정할 수 있으나,
+    # 임상 사진에서 이 각도는 극히 드묾. aspect_ratio < 1.2 가드가 보완.
     while angle > 90:
         angle -= 180
     while angle <= -90:

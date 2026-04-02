@@ -69,6 +69,11 @@ def quality_gate_similarity(kpts_f: np.ndarray,
         status ('pass'/'warn'/'fail'), metrics dict
     """
     n_total = len(kpts_f)
+    if inliers is None:
+        return 'fail', {'n_total': n_total, 'n_inlier': 0, 'inlier_ratio': 0.0,
+                        'reproj_median': 999.0, 'reproj_p90': 999.0,
+                        'hull_area': 0.0, 'hull_coverage': 0.0,
+                        'det': 0.0, 'scale': 0.0, 'rotation_deg': 0.0}
     inlier_mask = inliers.flatten().astype(bool)
     n_inlier = int(np.sum(inlier_mask))
 
@@ -148,6 +153,9 @@ def quality_gate_affine(kpts_f: np.ndarray,
         status ('pass'/'warn'/'fail'), metrics dict
     """
     n_total = len(kpts_f)
+    if inliers is None:
+        return 'fail', {'n_total': n_total, 'n_inlier': 0, 'inlier_ratio': 0.0,
+                        'reproj_median': 999.0, 'hull_coverage': 0.0, 'det': 0.0}
     inlier_mask = inliers.flatten().astype(bool)
     n_inlier = int(np.sum(inlier_mask))
 
