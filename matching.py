@@ -1,13 +1,14 @@
-"""
-matching.py — Phase B: LoFTR 매칭 + 마스크 기반 필터링
+"""Phase B: LoFTR 매칭 + 마스크 기반 필터링.
 
 모델 싱글턴 로딩. GUI 의존성 없음.
 """
 
-import numpy as np
+from __future__ import annotations
+
 import cv2
-import torch
 import kornia.feature as KF
+import numpy as np
+import torch
 
 # 모듈 레벨 싱글턴
 _loftr_model = None
@@ -27,9 +28,10 @@ def _get_loftr_model(pretrained: str = 'indoor_new') -> KF.LoFTR:
     return _loftr_model
 
 
-def loftr_match(img1_gray: np.ndarray,
-                img2_gray: np.ndarray,
-                conf_threshold: float = 0.5):
+def loftr_match(
+        img1_gray: np.ndarray, img2_gray: np.ndarray,
+        conf_threshold: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     LoFTR dense 매칭.
 
@@ -95,18 +97,24 @@ def apply_soft_mask(img_gray: np.ndarray,
     return result.astype(np.uint8)
 
 
-def filter_by_mask(kpts0: np.ndarray,
-                   kpts1: np.ndarray,
-                   conf: np.ndarray,
-                   mask0: np.ndarray,
-                   mask1: np.ndarray,
-                   sigma: int = 7,
-                   threshold: float = 0.3):
-    """
-    Soft mask 기반 치아 영역 대응점 필터링.
+def filter_by_mask(
+        kpts0: np.ndarray, kpts1: np.ndarray, conf: np.ndarray,
+        mask0: np.ndarray, mask1: np.ndarray,
+        sigma: int = 7, threshold: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Soft mask 기반 치아 영역 대응점 필터링.
+
+    Args:
+        kpts0: Fixed 키포인트 (N×2).
+        kpts1: Moving 키포인트 (N×2).
+        conf: Confidence 배열 (N,).
+        mask0: Fixed 마스크.
+        mask1: Moving 마스크.
+        sigma: Gaussian blur sigma.
+        threshold: 마스크 임계값.
 
     Returns:
-        filtered kpts0, kpts1, conf
+        (필터링된 kpts0, kpts1, conf) 튜플.
     """
     ksize = sigma * 2 + 1
     soft0 = cv2.GaussianBlur(mask0.astype(np.float32) / 255.0,
