@@ -28,11 +28,18 @@ jobs:
           pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
+          pip install SAM-2 huggingface_hub
           pip install pyinstaller
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
         run: |
-          pyinstaller --onedir --windowed --name "DKPregistrator" --icon app_icon.ico --noconfirm main_gui.py
+          pyinstaller --onedir --windowed --name "DKPregistrator" --icon app_icon.ico --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
+
+      - name: Build with PyInstaller (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --onedir --windowed --name "DKPregistrator" --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

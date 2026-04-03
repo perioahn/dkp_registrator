@@ -30,7 +30,13 @@ def _pip_install(*pkgs: str) -> None:
 
 try:
     from sam2.sam2_image_predictor import SAM2ImagePredictor
-except ImportError:
+except ImportError as exc:
+    if getattr(sys, "frozen", False):
+        raise RuntimeError(
+            f"번들 내 모듈 로드 실패: {exc}. "
+            "PyInstaller 빌드 시 --collect-all sam2 및 "
+            "--collect-all torch 플래그를 확인하세요."
+        ) from exc
     print("Installing SAM-2 + huggingface_hub ...")
     _pip_install("SAM-2", "huggingface_hub")
     from sam2.sam2_image_predictor import SAM2ImagePredictor
