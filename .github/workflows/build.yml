@@ -1,0 +1,49 @@
+name: Build App
+
+on:
+  workflow_dispatch:  # 수동 실행
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS
+          - os: windows-latest
+            name: Windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
+          pip install sam2 huggingface_hub
+          pip install pyinstaller
+
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onedir --windowed --name "DKPregistrator" --icon app_icon.ico --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
+
+      - name: Build with PyInstaller (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --onedir --windowed --name "DKPregistrator" --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DKPregistrator-${{ matrix.name }}
+          path: dist/DKPregistrator/
+          retention-days: 30
