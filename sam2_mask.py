@@ -37,8 +37,8 @@ except ImportError as exc:
             "PyInstaller 빌드 시 --collect-all sam2 및 "
             "--collect-all torch 플래그를 확인하세요."
         ) from exc
-    print("Installing SAM-2 + huggingface_hub ...")
-    _pip_install("SAM-2", "huggingface_hub")
+    print("Installing sam2 + huggingface_hub ...")
+    _pip_install("sam2", "huggingface_hub")
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 import cv2

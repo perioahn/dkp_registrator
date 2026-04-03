@@ -28,7 +28,7 @@ jobs:
           pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
-          pip install SAM-2 huggingface_hub
+          pip install sam2 huggingface_hub
           pip install pyinstaller
 
       - name: Build with PyInstaller (Windows)
