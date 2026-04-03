@@ -279,6 +279,13 @@ class DualMaskSelector:
         self.active = 0
         self._last_set = -1
         self._feat_cache: dict[int, tuple] = {}
+        # 모든 이미지 미리 인코딩
+        for idx, img in enumerate(self.images):
+            with torch.inference_mode():
+                self.sam.set_image(img)
+            self._feat_cache[idx] = (
+                self.sam._features, self.sam._orig_hw)
+        self._last_set = len(self.images) - 1
         # per-image state
         self.fg: list[list] = [[], []]
         self.bg: list[list] = [[], []]
@@ -528,6 +535,13 @@ class MultiMaskSelector:
         self.active = 0
         self._last_set = -1
         self._feat_cache: dict[int, tuple] = {}
+        # 모든 이미지 미리 인코딩
+        for idx, img in enumerate(self.images):
+            with torch.inference_mode():
+                self.sam.set_image(img)
+            self._feat_cache[idx] = (
+                self.sam._features, self.sam._orig_hw)
+        self._last_set = self.n - 1
         self.fg: list[list[list[float]]] = [[] for _ in range(self.n)]
         self.bg: list[list[list[float]]] = [[] for _ in range(self.n)]
         self.current_mask: list[np.ndarray | None] = [None] * self.n
