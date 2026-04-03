@@ -65,8 +65,10 @@ def load_sam2_predictor(
     """
     global _sam2_predictor
     if _sam2_predictor is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         _sam2_predictor = SAM2ImagePredictor.from_pretrained(
             model_name,
+            device=device,
             max_hole_area=max_hole_area,
             max_sprinkle_area=max_sprinkle_area,
         )
