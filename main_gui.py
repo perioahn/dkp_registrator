@@ -118,13 +118,15 @@ class MainGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("치아 정합 파이프라인")
-        self.root.geometry("900x800")
+        self.root.geometry("900x950")
 
         self.fixed_img: np.ndarray | None = None
         self.fixed_mask: np.ndarray | None = None
         self.result: dict | None = None
         self._photo_refs: list[ImageTk.PhotoImage] = []
         self._best_match_hint: tuple | None = None
+        # Anchor points per moving: {moving_idx: [(fx, fy, mx, my), ...]}
+        self.anchor_points_per_moving: dict[int, list[tuple]] = {}
 
         # Multi-moving state
         self.moving_imgs: list[np.ndarray | None] = [None]
@@ -228,11 +230,15 @@ class MainGUI:
             self.fixed_img = img
             self.fixed_mask = None
             self._best_match_hint = None
+            self.result = None
+            self._multi_regtest_results = {}
+            self._multi_regtest_selected = {}
+            self.anchor_points_per_moving.clear()
             self._update_mask_label()
+            self._update_anchor_label()
             print(f"[INFO] Fixed 로드: {os.path.basename(path)} "
                   f"({img.shape[1]}x{img.shape[0]})")
-            if self.result is None:
-                self._show_fixed_preview()
+            self._show_fixed_preview()
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
@@ -255,7 +261,14 @@ class MainGUI:
             self.moving_masks[moving_idx] = None
             self.moving_paths[moving_idx] = path
             self._best_match_hint = None
+            self.result = None
+            self._multi_regtest_results = {}
+            self._multi_regtest_selected = {}
+            self.anchor_points_per_moving.pop(moving_idx, None)
             self._update_mask_label()
+            self._update_anchor_label()
+            if self.fixed_img is not None:
+                self._show_fixed_preview()
             print(f"[INFO] Moving{moving_idx + 1} 로드: "
                   f"{os.path.basename(path)} "
                   f"({img.shape[1]}x{img.shape[0]})")
@@ -367,7 +380,7 @@ class MainGUI:
         self.falsecolor_label.config(image="", text="(등록 전)")
         self.metrics_text.configure(state="normal")
         self.metrics_text.delete("1.0", "end")
-        self.metrics_text.insert("1.0", "Fixed image loaded — Register를 실행하세요")
+        self.metrics_text.insert("1.0", "이미지 로드 → Select Masks (SAM2) → Register")
         self.metrics_text.configure(state="disabled")
 
     # ── SAM2 마스크 선택 (메인 스레드) ──
@@ -397,17 +410,20 @@ class MainGUI:
         # Build image list: [fixed, moving1, moving2, ...]
         images = []
         titles = []
-        f_resized, _ = resize_for_sam(self.fixed_img, SAM2_MAX_SIDE)
+        f_resized, f_scale = resize_for_sam(self.fixed_img, SAM2_MAX_SIDE)
         images.append(f_resized)
         titles.append("Fixed")
+        moving_scale_map: list[tuple[int, float]] = []  # (orig_idx, scale)
         for i, img in enumerate(self.moving_imgs):
             if img is not None:
-                m_resized, _ = resize_for_sam(img, SAM2_MAX_SIDE)
+                m_resized, m_scale = resize_for_sam(img, SAM2_MAX_SIDE)
                 images.append(m_resized)
                 titles.append(f"Moving{i + 1}")
+                moving_scale_map.append((i, m_scale))
 
         print(f"[INFO] {len(images)}개 이미지 마스크 선택...")
-        masks = select_multi_mask_interactive(images, titles, predictor)
+        masks, raw_anchors = select_multi_mask_interactive(
+            images, titles, predictor)
 
         if all(m is None for m in masks):
             print("[WARN] 마스크 미완료")
@@ -434,6 +450,20 @@ class MainGUI:
 
         self._best_match_hint = None
         self._update_mask_label()
+
+        # 앵커 좌표를 SAM 리사이즈 → 원본 좌표로 변환
+        self.anchor_points_per_moving.clear()
+        for img_idx, pairs in raw_anchors.items():
+            ms_idx = img_idx - 1  # images[0]=Fixed, 이후=Moving 순
+            if ms_idx < 0 or ms_idx >= len(moving_scale_map):
+                continue
+            orig_mi, m_scale = moving_scale_map[ms_idx]
+            converted = []
+            for fx, fy, mx, my in pairs:
+                converted.append((fx / f_scale, fy / f_scale,
+                                  mx / m_scale, my / m_scale))
+            self.anchor_points_per_moving[orig_mi] = converted
+        self._update_anchor_label()
         print("[INFO] 마스크 선택 완료")
 
     # ── 리사이즈 가능 이미지 팝업 유틸 ──
@@ -543,6 +573,12 @@ class MainGUI:
                 transform=axes[row_idx, 0].transAxes,
                 ha='right', va='center', fontsize=7, fontweight='bold')
 
+    # ── Anchor Points ──
+
+    def _update_anchor_label(self) -> None:
+        """앵커 포인트 상태 라벨을 갱신한다 (UI 숨김)."""
+        pass
+
     # ── Register (별도 스레드 → 2×4 비교 + 메인 결과) ──
 
     def _run_register(self) -> None:
@@ -578,9 +614,11 @@ class MainGUI:
                 for step, mi in enumerate(valid):
                     print(f"[Register] Moving{mi + 1} 시작 "
                           f"({step + 1}/{len(valid)})...")
+                    mi_anchors = self.anchor_points_per_moving.get(mi)
                     results = register_test(
                         self.fixed_img, self.moving_imgs[mi],
-                        self.fixed_mask, self.moving_masks[mi])
+                        self.fixed_mask, self.moving_masks[mi],
+                        anchor_points=mi_anchors or None)
                     all_results[mi] = results
                 elapsed = time.time() - t0
                 self.root.after(0, self._show_multi_register_results,
