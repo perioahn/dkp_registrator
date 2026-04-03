@@ -50,7 +50,7 @@ _sam2_predictor: SAM2ImagePredictor | None = None
 
 
 def load_sam2_predictor(
-        model_name: str = "facebook/sam2-hiera-large",
+        model_name: str = "facebook/sam2-hiera-tiny",
         max_hole_area: float = 300.0,
         max_sprinkle_area: float = 150.0) -> SAM2ImagePredictor:
     """SAM2 predictor를 싱글턴으로 로딩한다.
@@ -122,7 +122,8 @@ class MaskSelector:
         return cleaned.astype(bool)
 
     def _on_key(self, event) -> None:
-        if event.key == "z":
+        key = event.key
+        if key in ("z", "ㅋ"):
             # 현재 개체 확정 → 다음 개체
             if self.current_mask is not None:
                 self.confirmed.append(self._clean_single(self.current_mask))
@@ -131,13 +132,13 @@ class MaskSelector:
             self.current_mask = None
             # set_image 재호출 불필요 — 인코딩 유지, 포인트만 리셋
             self._redraw()
-        elif event.key == "c":
+        elif key in ("c", "ㅊ"):
             # 전체 완료: 현재 작업 중인 것도 포함
             if self.current_mask is not None:
                 self.confirmed.append(self._clean_single(self.current_mask))
             self.done = True
             plt.close(self.fig)
-        elif event.key == "x":
+        elif key in ("x", "ㅌ"):
             # 리셋: 확정된 개체 포함 전체 초기화
             self.fg.clear()
             self.bg.clear()
@@ -146,7 +147,7 @@ class MaskSelector:
             with torch.inference_mode():
                 self.sam.set_image(self.image_rgb)
             self._redraw()
-        elif event.key == "q":
+        elif key in ("q", "ㅂ"):
             self.done = True
             self.cancelled = True
             plt.close(self.fig)
@@ -320,8 +321,9 @@ class DualMaskSelector:
             self._predict(i)
 
     def _on_key(self, event) -> None:
+        key = event.key
         i = self.active
-        if event.key == "z":
+        if key in ("z", "ㅋ"):
             if self.current_mask[i] is not None:
                 self.confirmed[i].append(
                     self._clean_single(self.current_mask[i]))
@@ -329,14 +331,14 @@ class DualMaskSelector:
             self.bg[i].clear()
             self.current_mask[i] = None
             self._redraw()
-        elif event.key == "c":
+        elif key in ("c", "ㅊ"):
             for j in range(2):
                 if self.current_mask[j] is not None:
                     self.confirmed[j].append(
                         self._clean_single(self.current_mask[j]))
             self.done = True
             plt.close(self.fig)
-        elif event.key == "x":
+        elif key in ("x", "ㅌ"):
             self.fg[i].clear()
             self.bg[i].clear()
             self.current_mask[i] = None
@@ -348,7 +350,7 @@ class DualMaskSelector:
                 self.sam._features, self.sam._orig_hw)
             self._last_set = i
             self._redraw()
-        elif event.key == "q":
+        elif key in ("q", "ㅂ"):
             self.done = True
             self.cancelled = True
             plt.close(self.fig)
@@ -548,6 +550,10 @@ class MultiMaskSelector:
         self.confirmed: list[list[np.ndarray]] = [[] for _ in range(self.n)]
         self.done = False
         self.cancelled = False
+        # Anchor points: {moving_img_idx: [(fx, fy, mx, my), ...]}
+        self.anchors: dict[int, list[tuple[float, float, float, float]]] = {}
+        self._anchor_mode = False
+        self._anchor_pending: tuple[int, float, float] | None = None
 
     def _grid_layout(self) -> tuple[int, int]:
         """이미지 수에 따른 그리드 레이아웃을 반환한다.
@@ -577,21 +583,61 @@ class MultiMaskSelector:
     def _on_click(self, event) -> None:
         if event.inaxes is None or self.done:
             return
+        clicked_idx = None
         for i in range(self.n):
             if event.inaxes == self.axes[i]:
-                self.active = i
-                x, y = event.xdata, event.ydata
-                if event.button == 1:
-                    self.fg[i].append([x, y])
-                    self._predict(i)
-                elif event.button == 3:
-                    self.bg[i].append([x, y])
-                    self._predict(i)
+                clicked_idx = i
+                break
+        if clicked_idx is None:
+            return
+
+        x, y = event.xdata, event.ydata
+
+        if self._anchor_mode:
+            if event.button != 1:
                 return
+            if self._anchor_pending is None:
+                self._anchor_pending = (clicked_idx, x, y)
+            else:
+                pi, px, py = self._anchor_pending
+                if clicked_idx == pi:
+                    # 같은 이미지 → 위치 갱신
+                    self._anchor_pending = (clicked_idx, x, y)
+                elif pi == 0 and clicked_idx > 0:
+                    # Fixed → Moving
+                    self.anchors.setdefault(clicked_idx, []).append(
+                        (px, py, x, y))
+                    self._anchor_pending = None
+                    self._anchor_mode = False
+                elif pi > 0 and clicked_idx == 0:
+                    # Moving → Fixed
+                    self.anchors.setdefault(pi, []).append(
+                        (x, y, px, py))
+                    self._anchor_pending = None
+                    self._anchor_mode = False
+                else:
+                    # Moving → 다른 Moving → 갱신
+                    self._anchor_pending = (clicked_idx, x, y)
+            self._redraw()
+            return
+
+        self.active = clicked_idx
+        if event.button == 1:
+            self.fg[clicked_idx].append([x, y])
+            self._predict(clicked_idx)
+        elif event.button == 3:
+            self.bg[clicked_idx].append([x, y])
+            self._predict(clicked_idx)
 
     def _on_key(self, event) -> None:
+        key = event.key
         i = self.active
-        if event.key == "z":
+        if key in ("z", "ㅋ"):
+            if self._anchor_mode:
+                self._anchor_mode = False
+                self._anchor_pending = None
+                self._redraw()
+                return
             if self.current_mask[i] is not None:
                 self.confirmed[i].append(
                     self._clean_single(self.current_mask[i]))
@@ -599,14 +645,16 @@ class MultiMaskSelector:
             self.bg[i].clear()
             self.current_mask[i] = None
             self._redraw()
-        elif event.key == "c":
+        elif key in ("c", "ㅊ"):
+            self._anchor_mode = False
+            self._anchor_pending = None
             for j in range(self.n):
                 if self.current_mask[j] is not None:
                     self.confirmed[j].append(
                         self._clean_single(self.current_mask[j]))
             self.done = True
             plt.close(self.fig)
-        elif event.key == "x":
+        elif key in ("x", "ㅌ"):
             self.fg[i].clear()
             self.bg[i].clear()
             self.current_mask[i] = None
@@ -618,10 +666,19 @@ class MultiMaskSelector:
                 self.sam._features, self.sam._orig_hw)
             self._last_set = i
             self._redraw()
-        elif event.key == "q":
+        elif key in ("q", "ㅂ"):
             self.done = True
             self.cancelled = True
             plt.close(self.fig)
+        elif key in ("a", "ㅁ"):
+            self._anchor_mode = True
+            self._anchor_pending = None
+            self._redraw()
+        elif key in ("d", "ㅇ"):
+            self.anchors.clear()
+            self._anchor_mode = False
+            self._anchor_pending = None
+            self._redraw()
 
     def _switch_image(self, i: int) -> None:
         """i번째 이미지로 SAM2 컨텍스트를 전환한다 (캐싱)."""
@@ -694,9 +751,38 @@ class MultiMaskSelector:
                 ax.plot(p[0], p[1], "o", color="red", ms=7,
                         mec="white", mew=1.2)
 
+            # 앵커 포인트 표시
+            if i == 0:
+                for mi, pairs in self.anchors.items():
+                    for pn, (fx, fy, _mx, _my) in enumerate(pairs):
+                        ax.plot(fx, fy, "D", color="magenta", ms=10,
+                                mec="white", mew=1.5)
+                        ax.text(fx + 8, fy - 8, str(pn + 1),
+                                color="magenta", fontsize=9,
+                                fontweight="bold")
+            else:
+                for pn, (_fx, _fy, mx, my) in enumerate(
+                        self.anchors.get(i, [])):
+                    ax.plot(mx, my, "D", color="magenta", ms=10,
+                            mec="white", mew=1.5)
+                    ax.text(mx + 8, my - 8, str(pn + 1),
+                            color="magenta", fontsize=9,
+                            fontweight="bold")
+            if (self._anchor_pending is not None
+                    and self._anchor_pending[0] == i):
+                ax.plot(self._anchor_pending[1],
+                        self._anchor_pending[2],
+                        "D", color="orange", ms=12,
+                        mec="white", mew=2)
+
             nc = len(self.confirmed[i])
             np_ = len(self.fg[i]) + len(self.bg[i])
-            title = f"{self.titles[i]}  [confirmed: {nc} | pts: {np_}]"
+            na = (sum(len(v) for v in self.anchors.values())
+                  if i == 0 else len(self.anchors.get(i, [])))
+            title = f"{self.titles[i]}  [obj: {nc} | pts: {np_}"
+            if False and na:
+                title += f" | anchor: {na}"
+            title += "]"
 
             if i == self.active:
                 title = f"▶ {title}"
@@ -718,10 +804,15 @@ class MultiMaskSelector:
         for j in range(self.n, rows * cols):
             self.axes[j].set_visible(False)
 
-        self.fig.suptitle(
-            "L-click: select | R-click: exclude | "
-            "Z: next obj | X: reset side | C: finish | Q: cancel",
-            fontsize=9, y=0.02)
+        if self._anchor_mode:
+            if self._anchor_pending is None:
+                hint = "ANCHOR: click point on any image"
+            else:
+                hint = "ANCHOR: click corresponding point on the other image"
+        else:
+            hint = ("L/R-click: mask | Z: next obj | X: reset | "
+                    "C: finish | Q: cancel")
+        self.fig.suptitle(hint, fontsize=9, y=0.02)
         self.fig.canvas.draw_idle()
 
     def run(self) -> list[np.ndarray | None]:
@@ -769,7 +860,8 @@ class MultiMaskSelector:
 
 def select_multi_mask_interactive(
         images: list[np.ndarray], titles: list[str],
-        predictor: SAM2ImagePredictor) -> list[np.ndarray | None]:
+        predictor: SAM2ImagePredictor,
+) -> tuple[list[np.ndarray | None], dict[int, list[tuple]]]:
     """N개 이미지 병렬 마스크 선택 래퍼.
 
     Args:
@@ -778,14 +870,18 @@ def select_multi_mask_interactive(
         predictor: SAM2ImagePredictor.
 
     Returns:
-        N개 마스크 (uint8 0/1) 또는 None 엔트리의 리스트.
+        (masks, anchors) 튜플.
+        masks: N개 마스크 (uint8 0/1) 또는 None 리스트.
+        anchors: {moving_img_idx: [(fx, fy, mx, my), ...]} 딕셔너리.
     """
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
     globals()["plt"] = plt
 
-    masks = MultiMaskSelector(images, titles, predictor).run()
+    selector = MultiMaskSelector(images, titles, predictor)
+    masks = selector.run()
+    anchors = selector.anchors
 
     out = []
     for mask in masks:
@@ -794,7 +890,7 @@ def select_multi_mask_interactive(
             out.append((cleaned > 0).astype(np.uint8))
         else:
             out.append(None)
-    return out
+    return out, anchors
 
 
 # ── mask post-processing ─────────────────────────
