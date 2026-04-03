@@ -278,6 +278,7 @@ class DualMaskSelector:
         self.sam = sam
         self.active = 0
         self._last_set = -1
+        self._feat_cache: dict[int, tuple] = {}
         # per-image state
         self.fg: list[list] = [[], []]
         self.bg: list[list] = [[], []]
@@ -333,8 +334,11 @@ class DualMaskSelector:
             self.bg[i].clear()
             self.current_mask[i] = None
             self.confirmed[i].clear()
+            self._feat_cache.pop(i, None)
             with torch.inference_mode():
                 self.sam.set_image(self.images[i])
+            self._feat_cache[i] = (
+                self.sam._features, self.sam._orig_hw)
             self._last_set = i
             self._redraw()
         elif event.key == "q":
@@ -342,14 +346,28 @@ class DualMaskSelector:
             self.cancelled = True
             plt.close(self.fig)
 
+    def _switch_image(self, i: int) -> None:
+        """i번째 이미지로 SAM2 컨텍스트를 전환한다 (캐싱)."""
+        if self._last_set == i:
+            return
+        if self._last_set >= 0 and self.sam._is_image_set:
+            self._feat_cache[self._last_set] = (
+                self.sam._features, self.sam._orig_hw)
+        if i in self._feat_cache:
+            self.sam._features, self.sam._orig_hw = self._feat_cache[i]
+            self.sam._is_image_set = True
+        else:
+            with torch.inference_mode():
+                self.sam.set_image(self.images[i])
+            self._feat_cache[i] = (
+                self.sam._features, self.sam._orig_hw)
+        self._last_set = i
+
     def _predict(self, i: int) -> None:
         """i번째 이미지에 대해 SAM2 예측을 수행한다."""
         if not self.fg[i] and not self.bg[i]:
             return
-        if self._last_set != i:
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
-            self._last_set = i
+        self._switch_image(i)
         pts = np.array(self.fg[i] + self.bg[i], dtype=np.float32)
         lbl = np.array([1] * len(self.fg[i]) + [0] * len(self.bg[i]),
                         dtype=np.int32)
@@ -509,6 +527,7 @@ class MultiMaskSelector:
         self.sam = sam
         self.active = 0
         self._last_set = -1
+        self._feat_cache: dict[int, tuple] = {}
         self.fg: list[list[list[float]]] = [[] for _ in range(self.n)]
         self.bg: list[list[list[float]]] = [[] for _ in range(self.n)]
         self.current_mask: list[np.ndarray | None] = [None] * self.n
@@ -578,8 +597,11 @@ class MultiMaskSelector:
             self.bg[i].clear()
             self.current_mask[i] = None
             self.confirmed[i].clear()
+            self._feat_cache.pop(i, None)
             with torch.inference_mode():
                 self.sam.set_image(self.images[i])
+            self._feat_cache[i] = (
+                self.sam._features, self.sam._orig_hw)
             self._last_set = i
             self._redraw()
         elif event.key == "q":
@@ -587,14 +609,28 @@ class MultiMaskSelector:
             self.cancelled = True
             plt.close(self.fig)
 
+    def _switch_image(self, i: int) -> None:
+        """i번째 이미지로 SAM2 컨텍스트를 전환한다 (캐싱)."""
+        if self._last_set == i:
+            return
+        if self._last_set >= 0 and self.sam._is_image_set:
+            self._feat_cache[self._last_set] = (
+                self.sam._features, self.sam._orig_hw)
+        if i in self._feat_cache:
+            self.sam._features, self.sam._orig_hw = self._feat_cache[i]
+            self.sam._is_image_set = True
+        else:
+            with torch.inference_mode():
+                self.sam.set_image(self.images[i])
+            self._feat_cache[i] = (
+                self.sam._features, self.sam._orig_hw)
+        self._last_set = i
+
     def _predict(self, i: int) -> None:
         """i번째 이미지에 대해 SAM2 예측을 수행한다."""
         if not self.fg[i] and not self.bg[i]:
             return
-        if self._last_set != i:
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
-            self._last_set = i
+        self._switch_image(i)
         pts = np.array(self.fg[i] + self.bg[i], dtype=np.float32)
         lbl = np.array([1] * len(self.fg[i]) + [0] * len(self.bg[i]),
                         dtype=np.int32)

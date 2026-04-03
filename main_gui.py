@@ -662,9 +662,10 @@ class MainGUI:
 
         bar = ttk.Frame(top, padding=3)
         bar.pack(fill="x")
-        ttk.Button(bar, text="Save All",
-                   command=lambda: self._save_all_results(top)
-                   ).pack(side="right", padx=5)
+        if len(valid_indices) > 1:
+            ttk.Button(bar, text="Save All Selected",
+                       command=lambda: self._save_all_results(top)
+                       ).pack(side="right", padx=5)
 
         notebook = ttk.Notebook(top)
         notebook.pack(fill="both", expand=True)
