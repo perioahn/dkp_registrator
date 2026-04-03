@@ -20,6 +20,8 @@
   - **X**: 현재 이미지 리셋
   - **C**: 전체 완료
   - **Q**: 취소
+  - **A**: 앵커 포인트 설정 (고정상↔이동상 강제 대응점)
+  - **D**: 앵커 초기화
 
 ### 3. Register (정합 실행)
 - **Register** 버튼 클릭
@@ -38,7 +40,7 @@
 - Python 3.10+
 - PyTorch, torchvision
 - kornia (LoFTR)
-- SAM2 (HuggingFace에서 자동 다운로드)
+- SAM2 (`sam2-hiera-tiny`, HuggingFace에서 자동 다운로드)
 - OpenCV, NumPy, Pillow, matplotlib
 
 ```bash
@@ -51,4 +53,4 @@ pip install torch torchvision kornia opencv-python numpy Pillow matplotlib
 python main_gui.py
 ```
 
-또는 [Releases](https://github.com/perioahn/dkpregistrator/releases)에서 빌드된 실행 파일(Windows/macOS)을 다운로드.
+또는 [Releases](https://github.com/perioahn/dkp_registrator/releases)에서 빌드된 실행 파일(Windows/macOS)을 다운로드.
