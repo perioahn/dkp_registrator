@@ -129,9 +129,7 @@ class MaskSelector:
             self.fg.clear()
             self.bg.clear()
             self.current_mask = None
-            # set_image 재호출 (SAM2 내부 상태 리셋)
-            with torch.inference_mode():
-                self.sam.set_image(self.image_rgb)
+            # set_image 재호출 불필요 — 인코딩 유지, 포인트만 리셋
             self._redraw()
         elif event.key == "c":
             # 전체 완료: 현재 작업 중인 것도 포함
@@ -322,9 +320,6 @@ class DualMaskSelector:
             self.fg[i].clear()
             self.bg[i].clear()
             self.current_mask[i] = None
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
-            self._last_set = i
             self._redraw()
         elif event.key == "c":
             for j in range(2):
@@ -570,9 +565,6 @@ class MultiMaskSelector:
             self.fg[i].clear()
             self.bg[i].clear()
             self.current_mask[i] = None
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
-            self._last_set = i
             self._redraw()
         elif event.key == "c":
             for j in range(self.n):
