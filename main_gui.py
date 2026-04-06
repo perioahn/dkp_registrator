@@ -973,8 +973,11 @@ class MainGUI:
         if not path:
             return
         img_bgr = cv2.cvtColor(reg_img, cv2.COLOR_RGB2BGR)
-        ok = cv2.imwrite(path, img_bgr)
+        ext = os.path.splitext(path)[1] or '.jpg'
+        ok, buf = cv2.imencode(ext, img_bgr)
         if ok:
+            with open(path, 'wb') as f:
+                f.write(buf.tobytes())
             print(f"[INFO] Moving{moving_idx + 1} 결과 저장: {path}")
         else:
             print(f"[ERROR] 저장 실패: {path}")
@@ -1019,8 +1022,11 @@ class MainGUI:
             path = os.path.join(folder, filename)
 
             img_bgr = cv2.cvtColor(reg_img, cv2.COLOR_RGB2BGR)
-            ok = cv2.imwrite(path, img_bgr)
+            ext = os.path.splitext(path)[1] or '.jpg'
+            ok, buf = cv2.imencode(ext, img_bgr)
             if ok:
+                with open(path, 'wb') as f:
+                    f.write(buf.tobytes())
                 print(f"[INFO] 저장: {path}")
                 saved += 1
             else:
