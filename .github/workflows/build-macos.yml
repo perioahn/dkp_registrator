@@ -48,7 +48,11 @@ jobs:
 
       - name: Zip artifact (macOS)
         if: runner.os == 'macOS'
-        run: cd dist && zip -r ../DKPregistrator-macOS.zip DKPregistrator/
+        run: cd dist && zip -ry ../DKPregistrator-macOS.zip DKPregistrator.app/
+
+      - name: Verify macOS zip permissions
+        if: runner.os == 'macOS'
+        run: zipinfo DKPregistrator-macOS.zip | head -20
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
