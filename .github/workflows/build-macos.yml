@@ -41,9 +41,18 @@ jobs:
         run: |
           pyinstaller --onedir --windowed --name "DKPregistrator" --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
 
+      - name: Zip artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/DKPregistrator/* -DestinationPath DKPregistrator-Windows.zip
+
+      - name: Zip artifact (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && zip -r ../DKPregistrator-macOS.zip DKPregistrator/
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: DKPregistrator-${{ matrix.name }}
-          path: dist/DKPregistrator/
+          path: DKPregistrator-${{ matrix.name }}.zip
           retention-days: 30
