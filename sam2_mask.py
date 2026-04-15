@@ -554,6 +554,9 @@ class MultiMaskSelector:
         self.anchors: dict[int, list[tuple[float, float, float, float]]] = {}
         self._anchor_mode = False
         self._anchor_pending: tuple[int, float, float] | None = None
+        # Multi-moving anchor: Fixed 1점 + 각 Moving 1점씩
+        self._anchor_fixed_pt: tuple[float, float] | None = None
+        self._anchor_remaining: set[int] = set()  # 아직 안 찍은 moving idx
 
     def _grid_layout(self) -> tuple[int, int]:
         """이미지 수에 따른 그리드 레이아웃을 반환한다.
@@ -596,28 +599,26 @@ class MultiMaskSelector:
         if self._anchor_mode:
             if event.button != 1:
                 return
-            if self._anchor_pending is None:
-                self._anchor_pending = (clicked_idx, x, y)
-            else:
-                pi, px, py = self._anchor_pending
-                if clicked_idx == pi:
-                    # 같은 이미지 → 위치 갱신
-                    self._anchor_pending = (clicked_idx, x, y)
-                elif pi == 0 and clicked_idx > 0:
-                    # Fixed → Moving
-                    self.anchors.setdefault(clicked_idx, []).append(
-                        (px, py, x, y))
-                    self._anchor_pending = None
+            if clicked_idx == 0:
+                # Fixed 클릭
+                self._anchor_fixed_pt = (x, y)
+                self._anchor_pending = (0, x, y)
+            elif self._anchor_fixed_pt is not None:
+                # Moving 클릭 + Fixed 점 이미 있음 → 쌍 생성
+                fx, fy = self._anchor_fixed_pt
+                self.anchors.setdefault(clicked_idx, []).append(
+                    (fx, fy, x, y))
+                self._anchor_remaining.discard(clicked_idx)
+                if not self._anchor_remaining:
+                    # 모든 Moving 완료 → anchor mode 종료
                     self._anchor_mode = False
-                elif pi > 0 and clicked_idx == 0:
-                    # Moving → Fixed
-                    self.anchors.setdefault(pi, []).append(
-                        (x, y, px, py))
                     self._anchor_pending = None
-                    self._anchor_mode = False
+                    self._anchor_fixed_pt = None
                 else:
-                    # Moving → 다른 Moving → 갱신
-                    self._anchor_pending = (clicked_idx, x, y)
+                    self._anchor_pending = (0, fx, fy)
+            else:
+                # Moving 클릭 + Fixed 점 없음 → 무시 (Fixed 먼저 찍어야 함)
+                pass
             self._redraw()
             return
 
@@ -636,6 +637,8 @@ class MultiMaskSelector:
             if self._anchor_mode:
                 self._anchor_mode = False
                 self._anchor_pending = None
+                self._anchor_fixed_pt = None
+                self._anchor_remaining.clear()
                 self._redraw()
                 return
             if self.current_mask[i] is not None:
@@ -648,6 +651,8 @@ class MultiMaskSelector:
         elif key in ("c", "ㅊ"):
             self._anchor_mode = False
             self._anchor_pending = None
+            self._anchor_fixed_pt = None
+            self._anchor_remaining.clear()
             for j in range(self.n):
                 if self.current_mask[j] is not None:
                     self.confirmed[j].append(
@@ -673,11 +678,15 @@ class MultiMaskSelector:
         elif key in ("a", "ㅁ"):
             self._anchor_mode = True
             self._anchor_pending = None
+            self._anchor_fixed_pt = None
+            self._anchor_remaining = set(range(1, self.n))
             self._redraw()
         elif key in ("d", "ㅇ"):
             self.anchors.clear()
             self._anchor_mode = False
             self._anchor_pending = None
+            self._anchor_fixed_pt = None
+            self._anchor_remaining.clear()
             self._redraw()
 
     def _switch_image(self, i: int) -> None:
@@ -768,10 +777,11 @@ class MultiMaskSelector:
                     ax.text(mx + 8, my - 8, str(pn + 1),
                             color="magenta", fontsize=9,
                             fontweight="bold")
-            if (self._anchor_pending is not None
-                    and self._anchor_pending[0] == i):
-                ax.plot(self._anchor_pending[1],
-                        self._anchor_pending[2],
+            # Pending anchor: Fixed 점 표시
+            if (self._anchor_fixed_pt is not None
+                    and i == 0 and self._anchor_remaining):
+                ax.plot(self._anchor_fixed_pt[0],
+                        self._anchor_fixed_pt[1],
                         "D", color="orange", ms=12,
                         mec="white", mew=2)
 
@@ -780,7 +790,7 @@ class MultiMaskSelector:
             na = (sum(len(v) for v in self.anchors.values())
                   if i == 0 else len(self.anchors.get(i, [])))
             title = f"{self.titles[i]}  [obj: {nc} | pts: {np_}"
-            if False and na:
+            if na:
                 title += f" | anchor: {na}"
             title += "]"
 
@@ -805,10 +815,15 @@ class MultiMaskSelector:
             self.axes[j].set_visible(False)
 
         if self._anchor_mode:
-            if self._anchor_pending is None:
-                hint = "ANCHOR: click point on any image"
+            if self._anchor_fixed_pt is None:
+                hint = "ANCHOR: click point on Fixed image"
+            elif self._anchor_remaining:
+                remaining = sorted(self._anchor_remaining)
+                names = [self.titles[r] if r < len(self.titles)
+                         else f"img{r}" for r in remaining]
+                hint = f"ANCHOR: click on {', '.join(names)}"
             else:
-                hint = "ANCHOR: click corresponding point on the other image"
+                hint = "ANCHOR: click corresponding point"
         else:
             hint = ("L/R-click: mask | Z: next obj | X: reset | "
                     "C: finish | Q: cancel")

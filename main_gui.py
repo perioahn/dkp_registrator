@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """치아 정합 파이프라인 GUI.
 
-SAM2 마스크 선택 → Register (8-combo 비교) → 결과 선택/저장.
+SAM2 마스크 선택 → Register (피라미드 정합) → 결과 저장.
 """
 
 from __future__ import annotations
@@ -23,14 +23,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from register import (
-    CLAHE_CLIPS,
-    CONF_LEVELS,
-    MASK_SIGMAS,
-    MAX_SIDES,
-    false_color,
-    register_test,
-)
+from register import false_color, register_test
 from sam2_mask import (
     clean_mask,
     load_sam2_predictor,
@@ -138,6 +131,9 @@ class MainGUI:
         # Multi-registration results
         self._multi_regtest_results: dict[int, list[dict]] = {}
         self._multi_regtest_selected: dict[int, int] = {}
+        self._active_moving_idx: int = 0
+        self._valid_indices: list[int] = []
+        self._result_photo_refs: list = []
 
         self._build_ui()
         self._redirect_console()
@@ -183,6 +179,14 @@ class MainGUI:
         self.register_btn = ttk.Button(btn_frame, text="Register",
                                        command=self._run_register)
         self.register_btn.pack(side="left")
+        self.save_btn = ttk.Button(btn_frame, text="Save",
+                                   command=self._show_results_window,
+                                   state="disabled")
+        self.save_btn.pack(side="left", padx=5)
+        self.matches_btn = ttk.Button(btn_frame, text="Matches",
+                                      command=self._show_matches,
+                                      state="disabled")
+        self.matches_btn.pack(side="left", padx=5)
         self.status_label = ttk.Label(btn_frame, text="")
         self.status_label.pack(side="left", padx=10)
 
@@ -233,6 +237,7 @@ class MainGUI:
             self.result = None
             self._multi_regtest_results = {}
             self._multi_regtest_selected = {}
+            self.save_btn.config(state="disabled")
             self.anchor_points_per_moving.clear()
             self._update_mask_label()
             self._update_anchor_label()
@@ -264,6 +269,7 @@ class MainGUI:
             self.result = None
             self._multi_regtest_results = {}
             self._multi_regtest_selected = {}
+            self.save_btn.config(state="disabled")
             self.anchor_points_per_moving.pop(moving_idx, None)
             self._update_mask_label()
             self._update_anchor_label()
@@ -349,6 +355,7 @@ class MainGUI:
         self.moving_paths = new_paths
         self._multi_regtest_results.clear()
         self._multi_regtest_selected.clear()
+        self.save_btn.config(state="disabled")
         # Re-add rows
         for idx in range(len(self.moving_imgs)):
             self._add_moving_row(idx)
@@ -501,85 +508,13 @@ class MainGUI:
         lbl.bind("<Configure>", _on_resize)
         return lbl
 
-    # ── 2×4 그리드 유틸 ──
-
-    def _grid_dims(self) -> tuple[int, int]:
-        """결과 그리드 차원을 반환한다.
-
-        Returns:
-            (행 수, 열 수) 튜플.
-        """
-        n_rows = len(MAX_SIDES) * len(MASK_SIGMAS)
-        n_cols = len(CONF_LEVELS) * len(CLAHE_CLIPS)
-        return n_rows, n_cols
-
-    def _idx_to_rc(self, idx: int) -> tuple[int, int]:
-        """결과 인덱스를 그리드 (row, col) 좌표로 변환한다.
-
-        Args:
-            idx: 결과 리스트 인덱스.
-
-        Returns:
-            (row, col) 튜플.
-        """
-        n_rows, _ = self._grid_dims()
-        return idx % n_rows, idx // n_rows
-
-    def _screen_figsize(self, dpi: int = 85) -> tuple[float, float]:
-        """화면 크기에 맞는 matplotlib figure 크기를 계산한다.
-
-        Args:
-            dpi: Figure DPI.
-
-        Returns:
-            (width, height) 인치 단위 튜플.
-        """
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        fig_w = max(12, (sw - 60) / dpi)
-        fig_h = max(5, (sh - 160) / dpi)
-        return fig_w, fig_h
-
-    def _add_grid_headers(self, axes: np.ndarray,
-                          n_rows: int, n_cols: int) -> None:
-        """결과 그리드에 열/행 헤더를 추가한다.
-
-        Args:
-            axes: matplotlib axes 2D 배열.
-            n_rows: 행 수.
-            n_cols: 열 수.
-        """
-        n_clip = len(CLAHE_CLIPS)
-        for col_idx in range(n_cols):
-            conf_idx = col_idx // n_clip
-            clip_idx = col_idx % n_clip
-            hdr = f"c>{CONF_LEVELS[conf_idx]}"
-            if n_clip > 1:
-                hdr += f"\ncl={CLAHE_CLIPS[clip_idx]}"
-            axes[0, col_idx].text(
-                0.5, 1.2, hdr,
-                transform=axes[0, col_idx].transAxes,
-                ha='center', fontsize=8, fontweight='bold')
-
-        n_sig = len(MASK_SIGMAS)
-        for row_idx in range(n_rows):
-            ms_idx = row_idx // n_sig
-            sig_idx = row_idx % n_sig
-            lbl = f"ms={MAX_SIDES[ms_idx]}"
-            if n_sig > 1:
-                lbl += f"\nσ={MASK_SIGMAS[sig_idx]}"
-            axes[row_idx, 0].text(
-                -0.05, 0.5, lbl,
-                transform=axes[row_idx, 0].transAxes,
-                ha='right', va='center', fontsize=7, fontweight='bold')
-
     # ── Anchor Points ──
 
     def _update_anchor_label(self) -> None:
         """앵커 포인트 상태 라벨을 갱신한다 (UI 숨김)."""
         pass
 
-    # ── Register (별도 스레드 → 2×4 비교 + 메인 결과) ──
+    # ── Register (별도 스레드 → 피라미드 정합) ──
 
     def _run_register(self) -> None:
         """정합을 실행한다.
@@ -604,6 +539,7 @@ class MainGUI:
         for _, _, btn in self.moving_rows:
             btn.config(state="disabled")
         self.status_label.config(text="Register 진행 중...")
+        self.save_btn.config(state="disabled")
         self._multi_regtest_results.clear()
         self._multi_regtest_selected.clear()
 
@@ -652,7 +588,7 @@ class MainGUI:
     def _show_multi_register_results(
             self, all_results: dict[int, list[dict]],
             valid_indices: list[int], elapsed: float) -> None:
-        """다중 이동상 정합 결과를 탭 형태로 표시한다.
+        """정합 결과를 표시한다 (피라미드 단일 결과).
 
         Args:
             all_results: {이동상 인덱스: 결과 리스트} 딕셔너리.
@@ -661,235 +597,124 @@ class MainGUI:
         """
         self._restore_ui_after_register()
         self._multi_regtest_results = all_results
-        n_rows, n_cols = self._grid_dims()
+        self._valid_indices = valid_indices
 
-        # Find best per moving
-        rank = {'pass': 2, 'warn': 1, 'fail': 0}
         for mi in valid_indices:
-            results = all_results[mi]
-            best_idx = 0
-            best_score = (-1, -1, -1)
-            for idx, r in enumerate(results):
-                score = (rank.get(r['status'], 0),
-                         r['conf_threshold'],
-                         r.get('metrics', {}).get('n_inlier', 0))
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
-            self._multi_regtest_selected[mi] = best_idx
+            self._multi_regtest_selected[mi] = 0
 
-        n_pass_total = sum(
-            sum(1 for r in all_results[mi]
-                if r['status'] in ('pass', 'warn'))
-            for mi in valid_indices)
-        n_total = sum(len(all_results[mi]) for mi in valid_indices)
+        n_pass = sum(1 for mi in valid_indices
+                     if all_results[mi][0]['status'] in ('pass', 'warn'))
 
         self.status_label.config(
             text=f"Register: {len(valid_indices)} moving, "
-                 f"{n_pass_total}/{n_total} pass ({elapsed:.1f}s)")
+                 f"{n_pass}/{len(valid_indices)} pass ({elapsed:.1f}s)")
 
-        # Show first moving's best in main result
+        # Show first moving result in main area
         first_mi = valid_indices[0]
-        first_best = all_results[first_mi][
-            self._multi_regtest_selected[first_mi]]
-        self._show_main_result(first_best)
+        self._active_moving_idx = first_mi
+        self._show_main_result(all_results[first_mi][0])
 
-        # Create Toplevel with Notebook
+        # Enable Save button
+        self.save_btn.config(state="normal")
+
+        # Show results window
+        self._show_results_window()
+
+    # ── 결과 창 (N행 2열: 정합 + false color + Save) ──
+
+    def _show_results_window(self) -> None:
+        """모든 이동상 결과를 썸네일 그리드로 보여주는 창을 띄운다."""
+        if not self._multi_regtest_results:
+            return
+        valid = getattr(self, '_valid_indices', [])
+        if not valid:
+            valid = sorted(self._multi_regtest_results.keys())
+
         top = tk.Toplevel(self.root)
-        top.title(f"Register Results ({len(valid_indices)} moving)")
+        top.title(f"Register Results ({len(valid)} moving)")
 
-        bar = ttk.Frame(top, padding=3)
-        bar.pack(fill="x")
-        if len(valid_indices) > 1:
-            ttk.Button(bar, text="Save All Selected",
-                       command=lambda: self._save_all_results(top)
-                       ).pack(side="right", padx=5)
-
-        notebook = ttk.Notebook(top)
-        notebook.pack(fill="both", expand=True)
-
-        for mi in valid_indices:
-            tab = ttk.Frame(notebook)
-            notebook.add(tab, text=f"Moving{mi + 1}")
-            self._build_register_tab(tab, mi, all_results[mi], top)
-
-        def on_tab_change(event):
-            tab_idx = notebook.index(notebook.select())
-            mi = valid_indices[tab_idx]
-            sel_idx = self._multi_regtest_selected.get(mi, 0)
-            self._show_main_result(all_results[mi][sel_idx])
-
-        notebook.bind("<<NotebookTabChanged>>", on_tab_change)
-        top.state('zoomed')
-
-    def _format_selection_info(self, r: dict) -> str:
-        """선택된 결과의 정보 문자열을 생성한다.
-
-        Args:
-            r: 결과 딕셔너리.
-
-        Returns:
-            ``"Selected: conf>... ms=... (...)"`` 형식 문자열.
-        """
-        return (f"Selected: conf>{r['conf_threshold']} "
-                f"ms={r['max_side']} ({r['status'].upper()}, "
-                f"inlier={r.get('metrics', {}).get('n_inlier', '?')})")
-
-    def _build_register_tab(self, tab_frame: ttk.Frame, moving_idx: int,
-                            results: list[dict],
-                            parent_window: tk.Toplevel) -> None:
-        """결과 탭 하나를 구성한다.
-
-        2xN 그리드 캔버스, 정보 바, Save Selected 버튼을 포함한다.
-
-        Args:
-            tab_frame: 탭 프레임.
-            moving_idx: 이동상 인덱스.
-            results: 해당 이동상의 결과 리스트.
-            parent_window: 부모 Toplevel 창.
-        """
-        n_total = len(results)
-        n_rows, n_cols = self._grid_dims()
-        best_idx = self._multi_regtest_selected[moving_idx]
-
-        # Info bar inside tab
-        tab_bar = ttk.Frame(tab_frame, padding=3)
-        tab_bar.pack(fill="x")
-
-        info_var = tk.StringVar(
-            value=self._format_selection_info(results[best_idx]))
-        ttk.Label(tab_bar, textvariable=info_var).pack(side="left", padx=5)
-        ttk.Button(tab_bar, text="Save Selected",
-                   command=lambda: self._save_regtest_selected(
-                       parent_window, moving_idx)
+        # Save All 버튼 (상단)
+        top_bar = ttk.Frame(top, padding=5)
+        top_bar.pack(fill="x")
+        ttk.Button(top_bar, text="Save All",
+                   command=lambda: self._save_all_results(top)
                    ).pack(side="right", padx=5)
 
-        # Agg render
-        import matplotlib
-        matplotlib.use("Agg")
-        matplotlib.rcParams['font.family'] = 'Malgun Gothic'
-        matplotlib.rcParams['axes.unicode_minus'] = False
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-        from matplotlib.figure import Figure
+        # 스크롤 가능 영역
+        canvas = tk.Canvas(top)
+        scrollbar = ttk.Scrollbar(top, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
 
-        dpi = 85
-        fig_w, fig_h = self._screen_figsize(dpi)
-        fig = Figure(figsize=(fig_w, fig_h), dpi=dpi)
-        axes = fig.subplots(n_rows, n_cols)
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-        for idx, r in enumerate(results):
-            row, col = self._idx_to_rc(idx)
-            ax = axes[row, col]
-            is_best = (idx == best_idx)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-            if r['false_color'] is not None:
-                ax.imshow(r['false_color'])
-                inlier = r.get('metrics', {}).get('n_inlier', 0)
-                title = f"{r['status'].upper()[0]}{inlier}"
-            else:
-                ax.text(0.5, 0.5, "F", transform=ax.transAxes,
-                        ha='center', fontsize=8, color='red')
-                ax.set_facecolor('#f0f0f0')
-                title = f"F{r['n_matches']}"
+        # 마우스 휠 스크롤
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        top.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-            if is_best and r['false_color'] is not None:
-                ax.set_title(f"★{title}", fontsize=7, fontweight='bold',
-                             color='#FF6600', backgroundcolor='#FFFACD')
-                for spine in ax.spines.values():
-                    spine.set_edgecolor('#FF6600')
-                    spine.set_linewidth(2)
-                    spine.set_visible(True)
-            else:
-                ax.set_title(title, fontsize=7, fontweight='bold')
-            ax.axis('off')
+        thumb_max = 350
+        self._result_photo_refs = []
 
-        self._add_grid_headers(axes, n_rows, n_cols)
+        for row_i, mi in enumerate(valid):
+            r = self._multi_regtest_results[mi][0]
+            status = r['status'].upper()
+            m = r.get('metrics', {})
 
-        n_pass = sum(1 for r in results if r['status'] in ('pass', 'warn'))
-        fig.suptitle(
-            f"Moving{moving_idx + 1}: {n_pass}/{n_total} pass  "
-            f"★best — click to select",
-            fontsize=11, fontweight='bold', y=0.99)
-        fig.tight_layout(rect=[0.03, 0, 1, 0.96])
+            row_frame = ttk.Frame(scroll_frame, padding=5)
+            row_frame.pack(fill="x", pady=2)
 
-        canvas_agg = FigureCanvasAgg(fig)
-        canvas_agg.draw()
+            # 왼쪽: 정보 라벨
+            info = (f"Moving{mi + 1}:  {status}  "
+                    f"inlier={m.get('n_inlier', '?')}  "
+                    f"ratio={m.get('inlier_ratio', '?')}  "
+                    f"reproj={m.get('reproj_median', '?')}")
+            ttk.Label(row_frame, text=info, font=("Consolas", 9)
+                      ).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        fig_px_w = int(fig.get_figwidth() * fig.dpi)
-        fig_px_h = int(fig.get_figheight() * fig.dpi)
-        cell_boxes = []
-        for idx in range(n_total):
-            row, col = self._idx_to_rc(idx)
-            ax = axes[row, col]
-            bbox = ax.get_position()
-            x0 = int(bbox.x0 * fig_px_w)
-            y0 = int((1 - bbox.y1) * fig_px_h)
-            x1 = int(bbox.x1 * fig_px_w)
-            y1 = int((1 - bbox.y0) * fig_px_h)
-            cell_boxes.append((x0, y0, x1, y1))
+            # 이미지: 정합 결과 + false color
+            img_frame = ttk.Frame(row_frame)
+            img_frame.grid(row=1, column=0, sticky="w")
 
-        buf = canvas_agg.buffer_rgba()
-        img_array = np.asarray(buf)[:, :, :3].copy()
+            reg_img = r.get('registered_img')
+            fc_img = r.get('false_color')
 
-        pil_img = Image.fromarray(img_array)
-        canvas = tk.Canvas(tab_frame)
-        canvas.pack(fill="both", expand=True)
-        canvas._orig_pil = pil_img
-        canvas._orig_w = pil_img.width
-        canvas._orig_h = pil_img.height
-        canvas._cell_boxes = cell_boxes
-        canvas._best_idx = best_idx
-        canvas._sel_idx = best_idx
-        canvas._scale = 1.0
+            if reg_img is not None:
+                pil_reg = Image.fromarray(reg_img)
+                pil_reg.thumbnail((thumb_max, thumb_max), Image.LANCZOS)
+                photo_reg = ImageTk.PhotoImage(pil_reg)
+                self._result_photo_refs.append(photo_reg)
+                ttk.Label(img_frame, image=photo_reg).pack(side="left", padx=3)
 
-        def _redraw_canvas(event=None):
-            cw_ = canvas.winfo_width()
-            ch_ = canvas.winfo_height()
-            if cw_ < 10 or ch_ < 10:
-                return
-            s = min(cw_ / canvas._orig_w, ch_ / canvas._orig_h)
-            canvas._scale = s
-            nw_ = int(canvas._orig_w * s)
-            nh_ = int(canvas._orig_h * s)
-            resized = canvas._orig_pil.resize(
-                (nw_, nh_), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(resized)
-            canvas.delete("all")
-            canvas.create_image(0, 0, anchor="nw", image=photo)
-            canvas._photo = photo
-            bx0, by0, bx1, by1 = canvas._cell_boxes[
-                canvas._best_idx]
-            canvas.create_rectangle(
-                bx0*s, by0*s, bx1*s, by1*s,
-                outline="#FF6600", width=5, tags="best_rect")
-            si = canvas._sel_idx
-            if si != canvas._best_idx:
-                sx0, sy0, sx1, sy1 = canvas._cell_boxes[si]
-                canvas.create_rectangle(
-                    sx0*s, sy0*s, sx1*s, sy1*s,
-                    outline="#0066CC", width=6, tags="sel_rect")
-            canvas.tag_raise("sel_rect")
+            if fc_img is not None:
+                pil_fc = Image.fromarray(fc_img)
+                pil_fc.thumbnail((thumb_max, thumb_max), Image.LANCZOS)
+                photo_fc = ImageTk.PhotoImage(pil_fc)
+                self._result_photo_refs.append(photo_fc)
+                ttk.Label(img_frame, image=photo_fc).pack(side="left", padx=3)
 
-        canvas.bind("<Configure>", _redraw_canvas)
+            # 오른쪽: Save 버튼
+            ttk.Button(
+                row_frame, text="Save",
+                command=lambda mi_=mi, tw_=top: self._save_regtest_selected(
+                    tw_, mi_)
+            ).grid(row=1, column=1, sticky="e", padx=10)
 
-        def on_click(event):
-            s = canvas._scale
-            ox, oy = event.x / s, event.y / s
-            for idx, (x0, y0, x1, y1) in enumerate(cell_boxes):
-                if x0 <= ox <= x1 and y0 <= oy <= y1:
-                    self._multi_regtest_selected[moving_idx] = idx
-                    canvas._sel_idx = idx
-                    r = results[idx]
-                    info_var.set(self._format_selection_info(r))
-                    canvas.delete("sel_rect")
-                    canvas.create_rectangle(
-                        x0*s, y0*s, x1*s, y1*s,
-                        outline="#0066CC", width=6, tags="sel_rect")
-                    canvas.tag_raise("sel_rect")
-                    self._show_main_result(r)
-                    break
+            # 구분선
+            ttk.Separator(scroll_frame, orient="horizontal"
+                          ).pack(fill="x", padx=5)
 
-        canvas.bind("<Button-1>", on_click)
+        # 창 크기 설정
+        n_rows = len(valid)
+        win_h = min(200 + n_rows * 420, self.root.winfo_screenheight() - 100)
+        top.geometry(f"1000x{win_h}")
 
     # ── 메인 결과 영역 표시 ──
 
@@ -900,6 +725,8 @@ class MainGUI:
             entry: 결과 딕셔너리.
         """
         self.result = entry
+        self.matches_btn.config(
+            state="normal" if entry.get('match_viz') is not None else "disabled")
         self._photo_refs.clear()
 
         reg_img = entry.get('registered_img')
@@ -923,9 +750,7 @@ class MainGUI:
         # 메트릭
         self.metrics_text.configure(state="normal")
         self.metrics_text.delete("1.0", "end")
-        lines = [f"status: {status}",
-                 f"conf>{entry.get('conf_threshold', '?')} "
-                 f"ms={entry.get('max_side', '?')}"]
+        lines = [f"status: {status}", entry.get('label', '?')]
         for k in ['n_inlier', 'inlier_ratio', 'reproj_median',
                    'rotation_deg', 'scale']:
             v = metrics.get(k)
@@ -936,6 +761,22 @@ class MainGUI:
                     lines.append(f"{k}: {v}")
         self.metrics_text.insert("1.0", "  |  ".join(lines))
         self.metrics_text.configure(state="disabled")
+
+    # ── 매칭 시각화 ──
+
+    def _show_matches(self) -> None:
+        """현재 결과의 매칭 시각화를 팝업으로 표시한다."""
+        if self.result is None:
+            return
+        viz = self.result.get('match_viz')
+        if viz is None:
+            return
+        top = tk.Toplevel(self.root)
+        top.title(f"Matches — {self.result.get('label', '?')}")
+        pil_img = Image.fromarray(viz)
+        self._resizable_image(top, pil_img)
+        top.geometry(f"{min(pil_img.width, 1400)}x"
+                     f"{min(pil_img.height + 30, 800)}")
 
     # ── 선택 결과 저장 ──
 
