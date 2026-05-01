@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from register import false_color, register_test
+from register import false_color, register_test, register_test_lazy
 from sam2_mask import (
     clean_mask,
     load_sam2_predictor,
@@ -187,8 +187,25 @@ class MainGUI:
                                       command=self._show_matches,
                                       state="disabled")
         self.matches_btn.pack(side="left", padx=5)
+        self.lazy_var = tk.BooleanVar(value=False)
+        self.lazy_chk = ttk.Checkbutton(
+            btn_frame, text="Lazy Mode (8x slower, auto flip/rotate)",
+            variable=self.lazy_var)
+        self.lazy_chk.pack(side="left", padx=10)
         self.status_label = ttk.Label(btn_frame, text="")
         self.status_label.pack(side="left", padx=10)
+
+        # ── Lazy 진행 바 (Lazy 모드 정합 중에만 표시) ──
+        self.lazy_progress_frame = ttk.Frame(self.root, padding=(5, 0))
+        self.lazy_progress_label = ttk.Label(
+            self.lazy_progress_frame, text="", width=36)
+        self.lazy_progress_label.pack(side="left")
+        self.lazy_progress_bar = ttk.Progressbar(
+            self.lazy_progress_frame, mode="determinate",
+            maximum=8, length=300)
+        self.lazy_progress_bar.pack(side="left", fill="x", expand=True,
+                                    padx=5)
+        # 처음에는 숨김 (pack 안 함)
 
         # ── 결과 표시 ──
         result_frame = ttk.LabelFrame(self.root, text="결과", padding=5)
@@ -543,29 +560,74 @@ class MainGUI:
         self._multi_regtest_results.clear()
         self._multi_regtest_selected.clear()
 
+        is_lazy = self.lazy_var.get()
+        register_fn = register_test_lazy if is_lazy else register_test
+        mode_label = "Lazy" if is_lazy else "Normal"
+
+        if is_lazy:
+            self._show_lazy_progress()
+
+        n_moving = len(valid)
+
+        def lazy_progress_cb_factory(step_idx: int):
+            def cb(cur: int, total: int, label: str):
+                self.root.after(
+                    0, self._update_lazy_progress,
+                    step_idx, n_moving, cur, total, label)
+            return cb
+
         def worker():
             t0 = time.time()
             all_results = {}
             try:
                 for step, mi in enumerate(valid):
-                    print(f"[Register] Moving{mi + 1} 시작 "
-                          f"({step + 1}/{len(valid)})...")
+                    print(f"[Register-{mode_label}] Moving{mi + 1} 시작 "
+                          f"({step + 1}/{n_moving})...")
                     mi_anchors = self.anchor_points_per_moving.get(mi)
-                    results = register_test(
+                    kwargs = {}
+                    if is_lazy:
+                        kwargs['progress_callback'] = (
+                            lazy_progress_cb_factory(step))
+                    results = register_fn(
                         self.fixed_img, self.moving_imgs[mi],
                         self.fixed_mask, self.moving_masks[mi],
-                        anchor_points=mi_anchors or None)
+                        anchor_points=mi_anchors or None,
+                        **kwargs)
                     all_results[mi] = results
                 elapsed = time.time() - t0
+                self.root.after(0, self._hide_lazy_progress)
                 self.root.after(0, self._show_multi_register_results,
                                 all_results, valid, elapsed)
             except Exception as e:
                 elapsed = time.time() - t0
                 print(f"[ERROR] Register failed: {e}")
+                self.root.after(0, self._hide_lazy_progress)
                 self.root.after(0, self._on_register_done, elapsed)
 
         gc.collect()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_lazy_progress(self) -> None:
+        """Lazy 진행 바를 표시한다."""
+        self.lazy_progress_bar['value'] = 0
+        self.lazy_progress_label.config(text="Lazy: 0/8")
+        self.lazy_progress_frame.pack(fill="x", padx=5, pady=2)
+
+    def _hide_lazy_progress(self) -> None:
+        """Lazy 진행 바를 숨긴다."""
+        self.lazy_progress_frame.pack_forget()
+
+    def _update_lazy_progress(self, step_idx: int, n_moving: int,
+                              cur: int, total: int, label: str) -> None:
+        """Lazy 진행 바 갱신 (메인 스레드에서 호출)."""
+        self.lazy_progress_bar['maximum'] = total
+        self.lazy_progress_bar['value'] = cur
+        if n_moving > 1:
+            txt = (f"Moving{step_idx + 1}/{n_moving}  "
+                   f"Lazy {cur}/{total} ({label})")
+        else:
+            txt = f"Lazy {cur}/{total} ({label})"
+        self.lazy_progress_label.config(text=txt)
 
     def _restore_ui_after_register(self) -> None:
         """정합 완료 후 UI 버튼 상태를 복원한다."""

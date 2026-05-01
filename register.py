@@ -834,6 +834,138 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
     return [entry]
 
 
+def _apply_orientation(img: np.ndarray, flip: bool, k: int) -> np.ndarray:
+    """이미지에 flip(좌우반전) + k×90° CCW 회전 적용."""
+    if flip:
+        img = cv2.flip(img, 1)
+    if k:
+        img = np.ascontiguousarray(np.rot90(img, k))
+    return img
+
+
+def _transform_anchors_orient(
+        anchors: list[tuple] | None,
+        w: int, h: int,
+        flip: bool, k: int) -> list[tuple] | None:
+    """앵커의 moving 좌표만 flip + k×90° CCW 변환.
+
+    Args:
+        anchors: [(fx, fy, mx, my), ...].
+        w, h: 변환 전 moving 이미지 너비/높이.
+        flip: 좌우반전 여부.
+        k: 90° CCW 회전 횟수 (0~3).
+
+    Returns:
+        변환된 앵커 리스트.
+    """
+    if not anchors:
+        return None
+    out = []
+    for fx, fy, mx, my in anchors:
+        x, y = mx, my
+        cw, ch = w, h
+        if flip:
+            x = cw - 1 - x
+        for _ in range(k):
+            # 90° CCW: (x, y) → (y, cw-1-x), 새 크기 (ch=cw_old, cw=ch_old) -- 아니다
+            # 다시: 이미지 (h, w) → np.rot90 → (w, h)
+            # 점 (x, y) → (y, w-1-x)
+            new_x = y
+            new_y = cw - 1 - x
+            x, y = new_x, new_y
+            cw, ch = ch, cw  # 회전 후 너비/높이 swap
+        out.append((fx, fy, x, y))
+    return out
+
+
+def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
+                       fixed_mask: np.ndarray,
+                       moving_mask: np.ndarray,
+                       anchor_points: list[tuple] | None = None,
+                       progress_callback=None) -> list[dict]:
+    """Lazy 모드: moving 이미지 8가지 회전/flip 조합 시도 후 최적 결과 반환.
+
+    원본 + 90/180/270° 회전 × flip 여부 = 8가지.
+    각 조합에 대해 register_test를 호출하고 (status_rank, n_inlier) 점수로 선택.
+
+    Args:
+        fixed_img: 고정상 RGB 배열.
+        moving_img: 이동상 RGB 배열.
+        fixed_mask: 고정상 마스크 uint8.
+        moving_mask: 이동상 마스크 uint8.
+        anchor_points: [(fx, fy, mx, my), ...] 강제 대응점.
+        progress_callback: ``fn(current, total, label)`` 형태의 진행 콜백.
+
+    Returns:
+        결과 리스트 (단일 entry — 최적 orientation 결과).
+    """
+    h, w = moving_img.shape[:2]
+    rank = {'pass': 2, 'warn': 1, 'fail': 0}
+
+    best_entry = None
+    best_score = (-1, -1)
+    best_label = None
+    attempts = []
+    total = 8
+    cur = 0
+
+    for flip in (False, True):
+        for k in range(4):
+            cur += 1
+            label = f"{'F' if flip else ''}R{k * 90}"
+            if progress_callback is not None:
+                try:
+                    progress_callback(cur, total, label)
+                except Exception:
+                    pass
+            print(f"\n{'#'*50}")
+            print(f"[Lazy {cur}/{total}] orientation: flip={flip} "
+                  f"rot={k * 90}° ({label})")
+            print(f"{'#'*50}")
+
+            m_t = _apply_orientation(moving_img, flip, k)
+            mmask_t = _apply_orientation(moving_mask, flip, k)
+            anchors_t = _transform_anchors_orient(
+                anchor_points, w, h, flip, k)
+
+            try:
+                results = register_test(
+                    fixed_img, m_t, fixed_mask, mmask_t,
+                    anchor_points=anchors_t)
+            except Exception as e:
+                print(f"[Lazy] {label} 실패: {e}")
+                continue
+
+            if not results:
+                continue
+            r = results[0]
+            r['lazy_orientation'] = (flip, k)
+            r['lazy_label'] = label
+            score = (rank.get(r['status'], 0),
+                     r.get('metrics', {}).get('n_inlier', 0))
+            attempts.append((label, r['status'], score[1]))
+            if score > best_score:
+                best_score = score
+                best_entry = r
+                best_label = label
+
+    print(f"\n{'='*60}")
+    print(f"[Lazy] Tried {len(attempts)} orientations:")
+    for lbl, st, ni in attempts:
+        marker = " ★" if lbl == best_label else ""
+        print(f"  {lbl}: {st.upper()}  inlier={ni}{marker}")
+    print(f"[Lazy] Best: {best_label}")
+    print(f"{'='*60}\n")
+
+    if best_entry is None:
+        return [_make_fail_entry('lazy_all_failed')]
+
+    # 라벨에 orientation 추가
+    orig_label = best_entry.get('label', '?')
+    best_entry['label'] = f"{orig_label} [{best_label}]"
+    return [best_entry]
+
+
 def false_color(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
     """정합 결과 false color 시각화.
 
