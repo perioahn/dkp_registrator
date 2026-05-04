@@ -64,62 +64,36 @@ def auto_orient_and_crop(
         padding_ratio: float = 0.1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
     """
-    SAM2 마스크 기반 자동 회전보정 + 크롭.
+    SAM2 마스크 기반 크롭. (회전 비활성화 — EXIF 적용 후 사용자 방향 신뢰)
+
+    이전 버전에서는 마스크 minAreaRect 주축으로 자동 회전을 적용했으나,
+    fixed/moving 마스크 형태가 크게 다른 경우 (예: 치아 1개 vs 치아 3개 배열)
+    각각 다른 방향으로 회전돼 정합 실패 원인이 됨. 이제 EXIF Orientation이
+    로드 시 픽셀에 적용되므로 사용자 방향을 신뢰하고 회전은 생략한다.
+    회전이 필요하면 Lazy Mode 사용.
 
     Returns:
-        cropped_img, cropped_mask, M_rot_3x3, crop_offset
+        cropped_img, cropped_mask, M_rot_3x3 (항등), crop_offset
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise ValueError("마스크에서 contour를 찾을 수 없음")
 
-    all_pts = np.vstack(contours)
-    rect = cv2.minAreaRect(all_pts)
-    center, (rect_w, rect_h), angle = rect
-
-    # angle 정규화: width > height 보장
-    if rect_w < rect_h:
-        angle += 90
-        rect_w, rect_h = rect_h, rect_w
-
-    # 180도 모호성 제거: [-90, 90) 범위로 정규화
-    # 직사각형은 180도 회전 대칭이므로 동일 형상이 0도 또는 180도로 반환될 수 있음
-    # 제한: 실제 치아 배열이 정확히 ±90도에 걸칠 경우 불안정할 수 있으나,
-    # 임상 사진에서 이 각도는 극히 드묾. aspect_ratio < 1.2 가드가 보완.
-    while angle > 90:
-        angle -= 180
-    while angle <= -90:
-        angle += 180
-
-    # 정사각형 배열이면 회전 불안정 → 스킵
-    aspect_ratio = max(rect_w, rect_h) / (min(rect_w, rect_h) + 1e-6)
-    if aspect_ratio < 1.2:
-        angle = 0
-
-    # 회전
-    rotated_img, M_rot = rotate_with_matrix(image, angle)
-
-    # mask 회전 (INTER_NEAREST)
-    M_2x3 = M_rot[:2, :]
-    new_h, new_w = rotated_img.shape[:2]
-    rotated_mask = cv2.warpAffine(mask, M_2x3, (new_w, new_h),
-                                   flags=cv2.INTER_NEAREST,
-                                   borderMode=cv2.BORDER_CONSTANT,
-                                   borderValue=0)
-    rotated_mask = (rotated_mask > 127).astype(np.uint8) * 255
+    M_rot = np.eye(3)
+    h, w = image.shape[:2]
 
     # 크롭 (패딩 포함)
-    x, y, bw, bh = cv2.boundingRect(rotated_mask)
+    x, y, bw, bh = cv2.boundingRect(mask)
     pad = int(max(bw, bh) * padding_ratio)
 
     y1 = max(0, y - pad)
-    y2 = min(new_h, y + bh + pad)
+    y2 = min(h, y + bh + pad)
     x1 = max(0, x - pad)
-    x2 = min(new_w, x + bw + pad)
+    x2 = min(w, x + bw + pad)
 
-    cropped_img = rotated_img[y1:y2, x1:x2]
-    cropped_mask = rotated_mask[y1:y2, x1:x2]
+    cropped_img = image[y1:y2, x1:x2]
+    cropped_mask = mask[y1:y2, x1:x2]
     crop_offset = (x1, y1)
 
     return cropped_img, cropped_mask, M_rot, crop_offset
