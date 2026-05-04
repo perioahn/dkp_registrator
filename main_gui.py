@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 from register import false_color, register_test, register_test_lazy
 from sam2_mask import (
@@ -39,6 +39,9 @@ THUMB_MAX = 400
 def load_image_rgb(path: str) -> np.ndarray:
     """이미지 파일을 RGB numpy 배열로 로드한다.
 
+    EXIF Orientation 태그를 픽셀에 실제로 적용하므로 Windows 탐색기/사진
+    뷰어에서 회전한 이미지(메타데이터만 변경)도 동일하게 표시된다.
+
     Args:
         path: 이미지 파일 경로. 한글 경로 지원.
 
@@ -48,11 +51,23 @@ def load_image_rgb(path: str) -> np.ndarray:
     Raises:
         FileNotFoundError: 이미지 디코딩 실패 시.
     """
-    buf = np.fromfile(path, dtype=np.uint8)
-    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise FileNotFoundError(f"이미지 로드 실패: {path}")
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    try:
+        with open(path, 'rb') as f:
+            pil = Image.open(f)
+            pil.load()
+        pil = ImageOps.exif_transpose(pil)
+        if pil.mode != 'RGB':
+            pil = pil.convert('RGB')
+        return np.array(pil)
+    except (FileNotFoundError, OSError):
+        raise
+    except Exception:
+        # PIL 실패 시 OpenCV로 fallback (EXIF 미적용)
+        buf = np.fromfile(path, dtype=np.uint8)
+        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"이미지 로드 실패: {path}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def np_to_photo(img_rgb: np.ndarray,
