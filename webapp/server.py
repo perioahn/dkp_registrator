@@ -531,9 +531,13 @@ async def sse():
                              headers={"Cache-Control": "no-cache"})
 
 
-DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                    "frontend", "dist")
-if os.path.isdir(DIST):
+# 소스 실행: webapp/frontend/dist · frozen(PyInstaller): _MEIPASS/webapp/frontend/dist
+_DIST_CANDIDATES = [
+    os.path.join(getattr(sys, "_MEIPASS", ""), "webapp", "frontend", "dist"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist"),
+]
+DIST = next((d for d in _DIST_CANDIDATES if d and os.path.isdir(d)), None)
+if DIST:
     app.mount("/", StaticFiles(directory=DIST, html=True), name="static")
 
 

@@ -2,6 +2,8 @@ name: Build App
 
 on:
   workflow_dispatch:  # 수동 실행
+  push:
+    tags: ["v*"]
 
 jobs:
   build:
@@ -29,17 +31,37 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
           pip install sam2 huggingface_hub
+          pip install fastapi uvicorn python-multipart
           pip install pyinstaller
 
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
-        run: |
-          pyinstaller --onedir --windowed --name "DKPregistrator" --icon app_icon.ico --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
+        run: >
+          pyinstaller --onedir --windowed --name "DKPregistrator"
+          --icon app_icon.ico --noconfirm
+          --hidden-import sam2 --hidden-import sam2.sam2_image_predictor
+          --hidden-import sam2.modeling --hidden-import huggingface_hub
+          --hidden-import main_gui
+          --collect-all kornia --collect-all sam2 --collect-all torch
+          --collect-all uvicorn
+          --add-data "webapp/frontend/dist;webapp/frontend/dist"
+          --exclude-module tensorboard --exclude-module IPython
+          --exclude-module jupyter --exclude-module notebook
+          launcher.py
 
       - name: Build with PyInstaller (macOS)
         if: runner.os == 'macOS'
-        run: |
-          pyinstaller --onedir --windowed --name "DKPregistrator" --noconfirm --hidden-import sam2 --hidden-import sam2.sam2_image_predictor --hidden-import sam2.modeling --hidden-import huggingface_hub --collect-all kornia --collect-all sam2 --collect-all torch --exclude-module tensorboard --exclude-module IPython --exclude-module jupyter --exclude-module notebook main_gui.py
+        run: >
+          pyinstaller --onedir --windowed --name "DKPregistrator" --noconfirm
+          --hidden-import sam2 --hidden-import sam2.sam2_image_predictor
+          --hidden-import sam2.modeling --hidden-import huggingface_hub
+          --hidden-import main_gui
+          --collect-all kornia --collect-all sam2 --collect-all torch
+          --collect-all uvicorn
+          --add-data "webapp/frontend/dist:webapp/frontend/dist"
+          --exclude-module tensorboard --exclude-module IPython
+          --exclude-module jupyter --exclude-module notebook
+          launcher.py
 
       - name: Zip artifact (Windows)
         if: runner.os == 'Windows'
@@ -60,3 +82,9 @@ jobs:
           name: DKPregistrator-${{ matrix.name }}
           path: DKPregistrator-${{ matrix.name }}.zip
           retention-days: 30
+
+      - name: Release (on tag)
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: DKPregistrator-${{ matrix.name }}.zip
