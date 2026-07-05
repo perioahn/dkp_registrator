@@ -21,3 +21,4 @@ dist/
 
 # Misc
 *.log
+webapp/frontend/node_modules/
