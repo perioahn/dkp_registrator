@@ -5,9 +5,13 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write  # 태그 릴리스 자동 첨부
+
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-14
