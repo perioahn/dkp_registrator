@@ -119,6 +119,42 @@ def work_scale(img_id: str) -> float:
 _loop: asyncio.AbstractEventLoop | None = None
 _subs: set[asyncio.Queue] = set()
 _sub_lock = threading.Lock()
+_last_disconnect = time.monotonic()
+
+
+def _client_count() -> int:
+    with _sub_lock:
+        return len(_subs)
+
+
+def _idle_seconds() -> float:
+    with _sub_lock:
+        if _subs:
+            return 0.0
+        return time.monotonic() - _last_disconnect
+
+
+def _auto_shutdown_loop() -> None:
+    """브라우저 탭이 모두 닫히고 30초 지나면 종료 (정합 실행 중엔 대기).
+
+    첫 접속 전 90초 유예. --persist 또는 --no-browser 시 비활성.
+    """
+    started = time.monotonic()
+    ever = False
+    while True:
+        time.sleep(5)
+        if _client_count() > 0:
+            ever = True
+            continue
+        if SESSION.running:
+            continue  # 정합 도중엔 절대 안 죽음
+        if not ever:
+            if time.monotonic() - started < 90:
+                continue
+            os._exit(0)
+        if _idle_seconds() > 30:
+            log.info("UI 종료 감지 - 서버 종료")
+            os._exit(0)
 
 
 def publish(event: str, data: dict) -> None:
@@ -477,6 +513,7 @@ async def sse():
         _subs.add(q)
 
     async def gen():
+        global _last_disconnect
         try:
             yield "event: hello\ndata: {}\n\n"
             while True:
@@ -487,6 +524,8 @@ async def sse():
         finally:
             with _sub_lock:
                 _subs.discard(q)
+                if not _subs:
+                    _last_disconnect = time.monotonic()
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache"})
@@ -505,7 +544,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--persist", action="store_true",
+                    help="브라우저를 닫아도 서버 유지 (개발용)")
     args = ap.parse_args()
+    if not args.persist:
+        threading.Thread(target=_auto_shutdown_loop, daemon=True,
+                         name="auto-exit").start()
     if not args.no_browser:
         threading.Timer(1.5, lambda: webbrowser.open(
             f"http://127.0.0.1:{args.port}/")).start()
