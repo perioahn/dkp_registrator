@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 import cv2
 
+from config import DEFAULT, PipelineConfig
 from matching import apply_soft_mask, filter_by_mask, loftr_match
 from preprocess import apply_clahe, auto_orient_and_crop, resize_to_max
 from transform import (
@@ -16,346 +17,9 @@ from transform import (
     quality_gate_similarity,
 )
 
-# 피라미드 정합
-PYRAMID_LEVELS = (320, 480, 640)
-PYRAMID_CONF = 0.2
-
-
-def register_pair(fixed_img: np.ndarray,
-                  moving_img: np.ndarray,
-                  fixed_mask: np.ndarray,
-                  moving_mask: np.ndarray,
-                  refine: bool = False,
-                  force_nocrop: bool = False,
-                  hint: tuple | None = None) -> dict:
-    """전체 정합 파이프라인.
-
-    hint=(conf, max_side, clahe_clip, mask_sigma) 제공 시 최우선 시도.
-    hint 미제공 시 기본 cascade: CLAHE=2.0, sigma=5, conf×max_side 순회.
-
-    Args:
-        fixed_img: 고정상 RGB 배열.
-        moving_img: 이동상 RGB 배열.
-        fixed_mask: 고정상 마스크 uint8.
-        moving_mask: 이동상 마스크 uint8.
-        refine: 미사용 (하위호환).
-        force_nocrop: True이면 크롭 전처리 건너뛰기.
-        hint: (conf, max_side[, clahe_clip, mask_sigma]) 튜플.
-
-    Returns:
-        정합 결과 딕셔너리.
-    """
-    debug = {}
-
-    if np.sum(fixed_mask > 0) == 0 or np.sum(moving_mask > 0) == 0:
-        return {
-            'registered_img': None, 'M_full': None,
-            'metrics': {'gate': 'none', 'status': 'fail', 'reason': 'empty_mask'},
-            'path': 'failed', 'debug_images': debug,
-        }
-
-    # hint 정규화: 2-tuple → 4-tuple
-    if hint is not None:
-        hint = tuple(hint)
-        if len(hint) == 2:
-            hint = (hint[0], hint[1], 2.0, 5)
-
-    # === Phase A: 크롭 + 회전 (CLAHE는 cascade에서) ===
-    crop_ok = False
-    if not force_nocrop:
-        print("[Phase A] 자동 크롭+회전 전처리...")
-        try:
-            fixed_crop, fixed_mask_crop, M_rot_f, crop_off_f = \
-                auto_orient_and_crop(fixed_img, fixed_mask)
-            moving_crop, moving_mask_crop, M_rot_m, crop_off_m = \
-                auto_orient_and_crop(moving_img, moving_mask)
-            debug['fixed_crop'] = fixed_crop
-            debug['moving_crop'] = moving_crop
-            crop_ok = True
-        except Exception as e:
-            print(f"[WARN] 크롭 전처리 실패: {e}, no-crop 시도...")
-
-    # === Phase B+C: cascade ===
-    _MIN_FOR_ESTIMATE = 4
-    result_path = None
-    M_loftr = None
-    final_metrics = None
-    best_rejected = None
-    use_crop = True
-    scale_f = scale_m = None
-
-    # --- 크롭 경로 cascade ---
-    if crop_ok:
-        _crop_cascade = [(c, m, 2.0, 5) for c in (0.3, 0.2, 0.15, 0.1)
-                         for m in (640, 480)]
-        if hint is not None:
-            ht = hint
-            if ht in _crop_cascade:
-                _crop_cascade.remove(ht)
-            _crop_cascade.insert(0, ht)
-            print(f"[INFO] hint: conf={ht[0]}, ms={ht[1]}, "
-                  f"clahe={ht[2]}, σ={ht[3]}")
-
-        fixed_crop_gray = cv2.cvtColor(fixed_crop, cv2.COLOR_RGB2GRAY)
-        moving_crop_gray = cv2.cvtColor(moving_crop, cv2.COLOR_RGB2GRAY)
-        clahe_cache = {}
-
-        for conf_thresh, ms, clip, sig in _crop_cascade:
-            if clip not in clahe_cache:
-                clahe_cache[clip] = (
-                    apply_clahe(fixed_crop_gray, clip_limit=clip),
-                    apply_clahe(moving_crop_gray, clip_limit=clip))
-            fg, mg = clahe_cache[clip]
-            debug.setdefault('fixed_clahe', fg)
-            debug.setdefault('moving_clahe', mg)
-
-            fixed_resized, sf = resize_to_max(fg, ms)
-            moving_resized, sm = resize_to_max(mg, ms)
-
-            fixed_mask_resized = cv2.resize(fixed_mask_crop,
-                (fixed_resized.shape[1], fixed_resized.shape[0]),
-                interpolation=cv2.INTER_NEAREST)
-            moving_mask_resized = cv2.resize(moving_mask_crop,
-                (moving_resized.shape[1], moving_resized.shape[0]),
-                interpolation=cv2.INTER_NEAREST)
-
-            fixed_masked = apply_soft_mask(fixed_resized, fixed_mask_resized,
-                                           sigma=sig)
-            moving_masked = apply_soft_mask(moving_resized, moving_mask_resized,
-                                            sigma=sig)
-
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            tooth_area = float(np.sum(cv2.erode(fixed_mask_resized, kernel) > 0))
-
-            kpts0, kpts1, conf = loftr_match(
-                fixed_masked, moving_masked, conf_threshold=conf_thresh)
-            kpts0, kpts1, conf = filter_by_mask(
-                kpts0, kpts1, conf, fixed_mask_resized, moving_mask_resized)
-            n = len(kpts0)
-            print(f"[Phase B] 크롭 (conf≥{conf_thresh}, ms={ms}, "
-                  f"clahe={clip}, σ={sig}): {n}개")
-            debug['n_filtered_matches'] = n
-
-            if n < _MIN_FOR_ESTIMATE:
-                continue
-
-            # Similarity gate
-            M_sim, inliers_sim = cv2.estimateAffinePartial2D(
-                kpts1, kpts0, method=cv2.RANSAC,
-                ransacReprojThreshold=3.0, confidence=0.99)
-            if M_sim is not None:
-                status, metrics = quality_gate_similarity(
-                    kpts0, kpts1, M_sim, inliers_sim, tooth_area)
-                metrics.update(gate='similarity', status=status,
-                               crop_used=True, conf_threshold=conf_thresh,
-                               max_side=ms, clahe_clip=clip, mask_sigma=sig)
-
-                if status in ('pass', 'warn'):
-                    M_loftr = M_sim
-                    result_path = 'similarity'
-                    final_metrics = metrics
-                    scale_f, scale_m = sf, sm
-                    print(f"[Phase C] Similarity: {status} "
-                          f"(inlier={metrics['n_inlier']}/{metrics['n_total']}, "
-                          f"rot={metrics.get('rotation_deg', 0):.1f}°, "
-                          f"scale={metrics.get('scale', 1):.3f})")
-                    break
-                else:
-                    print(f"[Phase C] Similarity: FAIL "
-                          f"(inlier={metrics['n_inlier']}/{metrics['n_total']}, "
-                          f"reproj={metrics.get('reproj_median', 0):.2f})")
-                    if best_rejected is None or metrics['n_inlier'] > best_rejected.get('n_inlier', 0):
-                        best_rejected = metrics
-
-            # Affine gate
-            if result_path is None:
-                M_aff, inliers_aff = cv2.estimateAffine2D(
-                    kpts1, kpts0, method=cv2.RANSAC,
-                    ransacReprojThreshold=3.0, confidence=0.99)
-                if M_aff is not None:
-                    status, metrics = quality_gate_affine(
-                        kpts0, kpts1, M_aff, inliers_aff, tooth_area)
-                    metrics.update(gate='affine', status=status,
-                                   crop_used=True, conf_threshold=conf_thresh,
-                                   max_side=ms, clahe_clip=clip, mask_sigma=sig)
-
-                    if status in ('pass', 'warn'):
-                        M_loftr = M_aff
-                        result_path = 'affine'
-                        final_metrics = metrics
-                        scale_f, scale_m = sf, sm
-                        print(f"[Phase C] Affine: {status} "
-                              f"(inlier={metrics['n_inlier']}/{metrics['n_total']})")
-                        break
-                    else:
-                        print(f"[Phase C] Affine: FAIL "
-                              f"(inlier={metrics['n_inlier']}/{metrics['n_total']}, "
-                              f"reproj={metrics.get('reproj_median', 0):.2f})")
-                        if best_rejected is None or metrics.get('n_inlier', 0) > best_rejected.get('n_inlier', 0):
-                            best_rejected = metrics
-
-    # --- No-crop 경로 cascade ---
-    if result_path is None:
-        print("[INFO] 크롭 경로 실패, no-crop 시도...")
-
-        M_rot_f = np.eye(3); crop_off_f = (0, 0)
-        M_rot_m = np.eye(3); crop_off_m = (0, 0)
-        use_crop = False
-
-        fixed_gray_full = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY)
-        moving_gray_full = cv2.cvtColor(moving_img, cv2.COLOR_RGB2GRAY)
-
-        _nc_cascade = [(c, m, 2.0, 5) for c in (0.3, 0.2, 0.15, 0.1)
-                       for m in (640, 480)]
-        if hint is not None:
-            ht = hint
-            if ht in _nc_cascade:
-                _nc_cascade.remove(ht)
-            _nc_cascade.insert(0, ht)
-
-        clahe_cache_nc = {}
-
-        for conf_thresh, ms, clip, sig in _nc_cascade:
-            if clip not in clahe_cache_nc:
-                clahe_cache_nc[clip] = (
-                    apply_clahe(fixed_gray_full, clip_limit=clip),
-                    apply_clahe(moving_gray_full, clip_limit=clip))
-            fg, mg = clahe_cache_nc[clip]
-
-            fr_nc, sf = resize_to_max(fg, ms)
-            mr_nc, sm = resize_to_max(mg, ms)
-
-            fm_nc = cv2.resize(fixed_mask,
-                (fr_nc.shape[1], fr_nc.shape[0]), interpolation=cv2.INTER_NEAREST)
-            mm_nc = cv2.resize(moving_mask,
-                (mr_nc.shape[1], mr_nc.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-            f_masked_nc = apply_soft_mask(fr_nc, fm_nc, sigma=sig)
-            m_masked_nc = apply_soft_mask(mr_nc, mm_nc, sigma=sig)
-
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            tooth_area_nc = float(np.sum(cv2.erode(fm_nc, kernel) > 0))
-
-            kpts0, kpts1, conf = loftr_match(
-                f_masked_nc, m_masked_nc, conf_threshold=conf_thresh)
-            kpts0, kpts1, conf = filter_by_mask(
-                kpts0, kpts1, conf, fm_nc, mm_nc)
-            n = len(kpts0)
-            print(f"[Phase B] No-crop (conf≥{conf_thresh}, ms={ms}, "
-                  f"clahe={clip}, σ={sig}): {n}개")
-
-            if n < _MIN_FOR_ESTIMATE:
-                continue
-
-            # Similarity gate
-            M_sim, inliers_sim = cv2.estimateAffinePartial2D(
-                kpts1, kpts0, method=cv2.RANSAC,
-                ransacReprojThreshold=3.0, confidence=0.99)
-            if M_sim is not None:
-                status, metrics = quality_gate_similarity(
-                    kpts0, kpts1, M_sim, inliers_sim, tooth_area_nc)
-                metrics.update(gate='similarity', status=status,
-                               crop_used=False, conf_threshold=conf_thresh,
-                               max_side=ms, clahe_clip=clip, mask_sigma=sig)
-
-                if status in ('pass', 'warn'):
-                    M_loftr = M_sim
-                    result_path = 'similarity'
-                    final_metrics = metrics
-                    scale_f, scale_m = sf, sm
-                    print(f"[Phase C] Similarity: {status} "
-                          f"(inlier={metrics['n_inlier']}/{metrics['n_total']})")
-                    break
-                else:
-                    print(f"[Phase C] Similarity: FAIL "
-                          f"(inlier={metrics['n_inlier']}/{metrics['n_total']}, "
-                          f"reproj={metrics.get('reproj_median', 0):.2f})")
-                    if best_rejected is None or metrics['n_inlier'] > best_rejected.get('n_inlier', 0):
-                        best_rejected = metrics
-
-            # Affine gate
-            if result_path is None:
-                M_aff, inliers_aff = cv2.estimateAffine2D(
-                    kpts1, kpts0, method=cv2.RANSAC,
-                    ransacReprojThreshold=3.0, confidence=0.99)
-                if M_aff is not None:
-                    status, metrics = quality_gate_affine(
-                        kpts0, kpts1, M_aff, inliers_aff, tooth_area_nc)
-                    metrics.update(gate='affine', status=status,
-                                   crop_used=False, conf_threshold=conf_thresh,
-                                   max_side=ms, clahe_clip=clip, mask_sigma=sig)
-
-                    if status in ('pass', 'warn'):
-                        M_loftr = M_aff
-                        result_path = 'affine'
-                        final_metrics = metrics
-                        scale_f, scale_m = sf, sm
-                        print(f"[Phase C] Affine: {status} "
-                              f"(inlier={metrics['n_inlier']}/{metrics['n_total']})")
-                        break
-                    else:
-                        print(f"[Phase C] Affine: FAIL "
-                              f"(inlier={metrics['n_inlier']}/{metrics['n_total']}, "
-                              f"reproj={metrics.get('reproj_median', 0):.2f})")
-                        if best_rejected is None or metrics.get('n_inlier', 0) > best_rejected.get('n_inlier', 0):
-                            best_rejected = metrics
-
-    # === 실패: 모든 cascade 소진 ===
-    if result_path is None:
-        fail_reason = 'insufficient_matches'
-        if best_rejected is not None:
-            fail_reason = (f"gate_fail: inlier={best_rejected.get('n_inlier', 0)}"
-                          f"/{best_rejected.get('n_total', 0)}")
-
-        print(f"[INFO] 정합 실패 — {fail_reason}")
-        print("[INFO] 마스크를 더 넓게/정확하게 지정 후 재시도하세요.")
-
-        if final_metrics is None:
-            final_metrics = {'gate': 'none', 'status': 'fail'}
-        final_metrics['reason'] = fail_reason
-
-        return {
-            'registered_img': None, 'M_full': None,
-            'metrics': final_metrics, 'path': 'failed', 'debug_images': debug,
-        }
-
-    # === Phase D: 행렬 역산 + 원본 적용 ===
-    print(f"[Phase D] path={result_path}, crop={'yes' if use_crop else 'no'}, "
-          f"ms={final_metrics.get('max_side', '?')}")
-
-    if result_path in ('similarity', 'affine'):
-        try:
-            M_full = compose_full_matrix(
-                M_loftr,
-                M_rot_f, crop_off_f, scale_f,
-                M_rot_m, crop_off_m, scale_m
-            )
-        except np.linalg.LinAlgError:
-            final_metrics['status'] = 'fail'
-            return {
-                'registered_img': None, 'M_full': None,
-                'metrics': final_metrics, 'path': 'failed', 'debug_images': debug,
-            }
-
-        registered = cv2.warpAffine(
-            moving_img, M_full[:2, :],
-            (fixed_img.shape[1], fixed_img.shape[0])
-        )
-
-        debug['false_color'] = false_color(fixed_img, registered)
-
-        return {
-            'registered_img': registered,
-            'M_full': M_full,
-            'metrics': final_metrics,
-            'path': result_path,
-            'debug_images': debug,
-        }
-
-    return {
-        'registered_img': None, 'M_full': None,
-        'metrics': final_metrics, 'path': result_path, 'debug_images': debug,
-    }
+# 하위호환 별칭 (설정의 단일 출처는 config.PipelineConfig)
+PYRAMID_LEVELS = DEFAULT.pyramid_levels
+PYRAMID_CONF = DEFAULT.pyramid_conf
 
 
 # ── 피라미드 헬퍼 ──
@@ -491,37 +155,37 @@ def _fit_affine_lstsq(src: np.ndarray, dst: np.ndarray,
                      [res[3], res[4], res[5]]], dtype=np.float64)
 
 
-def _run_gate(k0, k1, conf, tooth_area):
+def _run_gate(k0, k1, conf, tooth_area, cfg: PipelineConfig = DEFAULT):
     """Similarity → Affine 폴백으로 RANSAC + quality gate 수행."""
     # Similarity
     M_sim, inliers_sim = cv2.estimateAffinePartial2D(
         k1, k0, method=cv2.RANSAC,
-        ransacReprojThreshold=3.0, confidence=0.99)
+        ransacReprojThreshold=cfg.ransac_thresh, confidence=0.99)
     if M_sim is not None:
         status, met = quality_gate_similarity(
-            k0, k1, M_sim, inliers_sim, tooth_area)
+            k0, k1, M_sim, inliers_sim, tooth_area, cfg=cfg.sim_gate)
         if status in ('pass', 'warn'):
             return M_sim, inliers_sim, 'similarity', status, met, conf
     # Affine fallback
     M_aff, inliers_aff = cv2.estimateAffine2D(
         k1, k0, method=cv2.RANSAC,
-        ransacReprojThreshold=3.0, confidence=0.99)
+        ransacReprojThreshold=cfg.ransac_thresh, confidence=0.99)
     if M_aff is not None:
         status, met = quality_gate_affine(
-            k0, k1, M_aff, inliers_aff, tooth_area)
+            k0, k1, M_aff, inliers_aff, tooth_area, cfg=cfg.aff_gate)
         if status in ('pass', 'warn'):
             return M_aff, inliers_aff, 'affine', status, met, conf
     return None, None, 'none', 'fail', {}, conf
 
 
 def _match_at_level(fixed_L, moving_L, fixed_mask_L, moving_mask_L,
-                    conf_threshold):
+                    conf_threshold, cfg: PipelineConfig = DEFAULT):
     """Global + Masked LoFTR → 합산 매칭."""
     # Global
     nk0, nk1, ncf = loftr_match(fixed_L, moving_L, conf_threshold=0.1)
     # Masked
-    f_masked = apply_soft_mask(fixed_L, fixed_mask_L, sigma=5)
-    m_masked = apply_soft_mask(moving_L, moving_mask_L, sigma=5)
+    f_masked = apply_soft_mask(fixed_L, fixed_mask_L, sigma=cfg.mask_sigma)
+    m_masked = apply_soft_mask(moving_L, moving_mask_L, sigma=cfg.mask_sigma)
     mk0, mk1, mcf = loftr_match(f_masked, m_masked, conf_threshold=0.1)
     mk0, mk1, mcf = filter_by_mask(
         mk0, mk1, mcf, fixed_mask_L, moving_mask_L)
@@ -542,9 +206,10 @@ def _match_at_level(fixed_L, moving_L, fixed_mask_L, moving_mask_L,
 def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
                           M_rot_f, crop_off_f, M_rot_m, crop_off_m,
                           fixed_img, moving_img,
-                          anchor_f_crop, anchor_m_crop):
-    """피라미드 L0 실패 시 640 단일 패스 폴백."""
-    ms = 640
+                          anchor_f_crop, anchor_m_crop,
+                          cfg: PipelineConfig = DEFAULT):
+    """피라미드 L0 실패 시 최고해상 단일 패스 폴백."""
+    ms = cfg.pyramid_levels[-1]
     fr, sf = resize_to_max(fc_clahe, ms)
     mr, sm = resize_to_max(mc_clahe, ms)
     fm = cv2.resize(fmc, (fr.shape[1], fr.shape[0]),
@@ -554,21 +219,21 @@ def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     tooth_area = float(np.sum(cv2.erode(fm, kernel) > 0))
 
-    k0, k1, conf = _match_at_level(fr, mr, fm, mm, PYRAMID_CONF)
+    k0, k1, conf = _match_at_level(fr, mr, fm, mm, cfg.pyramid_conf, cfg=cfg)
     n = len(k0)
-    print(f"[Fallback 640] {n} matches")
+    print(f"[Fallback {ms}] {n} matches")
 
-    if n < 4:
-        print(f"[Fallback 640] 매치 부족 → FAIL")
+    if n < cfg.min_matches:
+        print(f"[Fallback {ms}] 매치 부족 → FAIL")
         return _make_fail_entry(f'fallback_{n}_matches')
 
     M_est, inliers, gate, status, met, _ = _run_gate(
-        k0, k1, conf, tooth_area)
+        k0, k1, conf, tooth_area, cfg=cfg)
     if M_est is None:
-        print(f"[Fallback 640] gate FAIL")
+        print(f"[Fallback {ms}] gate FAIL")
         return _make_fail_entry('fallback_gate_fail')
 
-    print(f"[Fallback 640] {gate} {status}"
+    print(f"[Fallback {ms}] {gate} {status}"
           f"  inlier={met.get('n_inlier', 0)}"
           f"  ratio={met.get('inlier_ratio', 0):.2f}"
           f"  reproj={met.get('reproj_median', -1):.1f}"
@@ -603,8 +268,9 @@ def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
         return _make_fail_entry('fallback_singular')
 
     return {
-        'conf_threshold': PYRAMID_CONF, 'max_side': ms,
-        'clahe_clip': 2.0, 'mask_sigma': 5, 'n_matches': n,
+        'conf_threshold': cfg.pyramid_conf, 'max_side': ms,
+        'clahe_clip': cfg.clahe_clip, 'mask_sigma': cfg.mask_sigma,
+        'n_matches': n,
         'status': status, 'gate': gate, 'metrics': met,
         'M_full': M_full, 'registered_img': reg,
         'false_color': false_color(fixed_img, reg),
@@ -617,8 +283,9 @@ def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
 def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
                   fixed_mask: np.ndarray,
                   moving_mask: np.ndarray,
-                  anchor_points: list[tuple] | None = None) -> list[dict]:
-    """3단계 피라미드 정합 (320→480→640).
+                  anchor_points: list[tuple] | None = None,
+                  cfg: PipelineConfig = DEFAULT) -> list[dict]:
+    """다단계 피라미드 정합 (기본 320→480→640).
 
     Args:
         fixed_img: 고정상 RGB 배열.
@@ -626,11 +293,12 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
         fixed_mask: 고정상 마스크 uint8.
         moving_mask: 이동상 마스크 uint8.
         anchor_points: [(fx, fy, mx, my), ...] 강제 대응점.
+        cfg: 파이프라인 설정 (config.PROFILES 참고).
 
     Returns:
         결과 딕셔너리 리스트 (단일 항목).
     """
-    _MIN_FOR_ESTIMATE = 4
+    _MIN_FOR_ESTIMATE = cfg.min_matches
 
     # ── Phase A: crop + orient ──
     try:
@@ -661,8 +329,8 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
     # ── Grayscale + CLAHE ──
     fc_gray = cv2.cvtColor(fc, cv2.COLOR_RGB2GRAY) if fc.ndim == 3 else fc
     mc_gray = cv2.cvtColor(mc, cv2.COLOR_RGB2GRAY) if mc.ndim == 3 else mc
-    fc_clahe = apply_clahe(fc_gray, clip_limit=2.0)
-    mc_clahe = apply_clahe(mc_gray, clip_limit=2.0)
+    fc_clahe = apply_clahe(fc_gray, clip_limit=cfg.clahe_clip)
+    mc_clahe = apply_clahe(mc_gray, clip_limit=cfg.clahe_clip)
 
     # ── 피라미드 체인 ──
     M_accum = None       # 누적 3x3 (moving_resized → fixed_resized)
@@ -675,7 +343,7 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
     last_level = -1
     last_fixed_L = last_target_moving = None
 
-    for li, max_side in enumerate(PYRAMID_LEVELS):
+    for li, max_side in enumerate(cfg.pyramid_levels):
         print(f"\n[Pyramid L{li}] max_side={max_side}")
 
         # Resize to this level
@@ -705,34 +373,35 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
 
         # LoFTR: global + masked 합산
         k0, k1, conf = _match_at_level(
-            fixed_L, target_moving, fmask_L, target_mmask, PYRAMID_CONF)
+            fixed_L, target_moving, fmask_L, target_mmask,
+            cfg.pyramid_conf, cfg=cfg)
         n = len(k0)
         print(f"[Pyramid L{li}] {n} matches")
 
         if n < _MIN_FOR_ESTIMATE:
             print(f"[Pyramid L{li}] 매치 부족 ({n})")
             if li == 0:
-                print("[Pyramid] L0 실패 → 640 fallback")
+                print("[Pyramid] L0 실패 → 단일 패스 fallback")
                 return [_single_pass_fallback(
                     fc_clahe, mc_clahe, fmc, mmc,
                     M_rot_f, crop_off_f, M_rot_m, crop_off_m,
                     fixed_img, moving_img,
-                    anchor_f_crop, anchor_m_crop)]
+                    anchor_f_crop, anchor_m_crop, cfg=cfg)]
             break  # 이전 레벨 결과 사용
 
         # RANSAC + quality gate
         M_est, inliers, gate, status, met, _ = _run_gate(
-            k0, k1, conf, tooth_area)
+            k0, k1, conf, tooth_area, cfg=cfg)
 
         if M_est is None:
             print(f"[Pyramid L{li}] gate FAIL")
             if li == 0:
-                print("[Pyramid] L0 gate 실패 → 640 fallback")
+                print("[Pyramid] L0 gate 실패 → 단일 패스 fallback")
                 return [_single_pass_fallback(
                     fc_clahe, mc_clahe, fmc, mmc,
                     M_rot_f, crop_off_f, M_rot_m, crop_off_m,
                     fixed_img, moving_img,
-                    anchor_f_crop, anchor_m_crop)]
+                    anchor_f_crop, anchor_m_crop, cfg=cfg)]
             break
 
         # Compose: M_level = M_delta @ M_scaled
@@ -810,9 +479,9 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
     mviz = _draw_matches(last_fixed_L, last_target_moving,
                          last_kpts0, last_kpts1, last_inliers)
     entry = {
-        'conf_threshold': PYRAMID_CONF,
-        'max_side': PYRAMID_LEVELS[last_level],
-        'clahe_clip': 2.0, 'mask_sigma': 5,
+        'conf_threshold': cfg.pyramid_conf,
+        'max_side': cfg.pyramid_levels[last_level],
+        'clahe_clip': cfg.clahe_clip, 'mask_sigma': cfg.mask_sigma,
         'n_matches': len(last_kpts0),
         'status': final_status, 'gate': final_gate,
         'metrics': final_metrics, 'M_full': M_full,
@@ -878,15 +547,68 @@ def _transform_anchors_orient(
     return out
 
 
+def _prescreen_orientations(fixed_img, moving_img, fixed_mask, moving_mask,
+                            cfg: PipelineConfig = DEFAULT) -> list[tuple]:
+    """8가지 orientation을 저해상 단일 패스로 점수화한다.
+
+    크롭 전처리 없이 prescreen_side 해상도에서 LoFTR+게이트만 수행 —
+    풀 파이프라인 대비 수십 배 저렴한 근사 순위. 반환은 점수 내림차순
+    [(score, flip, k, label), ...], score=(status_rank, n_inlier).
+    """
+    side = cfg.lazy_prescreen_side
+    rank = {'pass': 2, 'warn': 1, 'fail': 0}
+
+    f_gray = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY) \
+        if fixed_img.ndim == 3 else fixed_img
+    m_gray = cv2.cvtColor(moving_img, cv2.COLOR_RGB2GRAY) \
+        if moving_img.ndim == 3 else moving_img
+    f_small, _ = resize_to_max(apply_clahe(f_gray, clip_limit=cfg.clahe_clip), side)
+    m_small0, _ = resize_to_max(apply_clahe(m_gray, clip_limit=cfg.clahe_clip), side)
+    fm_small = cv2.resize(fixed_mask, (f_small.shape[1], f_small.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+    mm_small0 = cv2.resize(moving_mask, (m_small0.shape[1], m_small0.shape[0]),
+                           interpolation=cv2.INTER_NEAREST)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    tooth_area = float(np.sum(cv2.erode(fm_small, kernel) > 0))
+
+    scored = []
+    for flip in (False, True):
+        for k in range(4):
+            label = f"{'F' if flip else ''}R{k * 90}"
+            m_s = _apply_orientation(m_small0, flip, k)
+            mm_s = _apply_orientation(mm_small0, flip, k)
+            try:
+                k0, k1, conf = _match_at_level(
+                    f_small, m_s, fm_small, mm_s, cfg.pyramid_conf, cfg=cfg)
+                if len(k0) < cfg.min_matches:
+                    score = (0, 0)
+                else:
+                    _, _, _, status, met, _ = _run_gate(
+                        k0, k1, conf, tooth_area, cfg=cfg)
+                    score = (rank.get(status, 0), met.get('n_inlier', 0))
+            except Exception as e:
+                print(f"[Lazy prescreen] {label} 오류: {e}")
+                score = (0, 0)
+            scored.append((score, flip, k, label))
+            print(f"[Lazy prescreen] {label}: rank={score[0]} inlier={score[1]}")
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+
 def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
                        fixed_mask: np.ndarray,
                        moving_mask: np.ndarray,
                        anchor_points: list[tuple] | None = None,
-                       progress_callback=None) -> list[dict]:
-    """Lazy 모드: moving 이미지 8가지 회전/flip 조합 시도 후 최적 결과 반환.
+                       progress_callback=None,
+                       cfg: PipelineConfig = DEFAULT) -> list[dict]:
+    """Lazy 모드: 8가지 회전/flip 조합 중 최적 orientation으로 정합.
 
-    원본 + 90/180/270° 회전 × flip 여부 = 8가지.
-    각 조합에 대해 register_test를 호출하고 (status_rank, n_inlier) 점수로 선택.
+    저해상 프리스크리닝으로 8조합을 점수화한 뒤, 상위 후보부터 풀 파이프라인
+    실행. pass가 나오면 즉시 종료, top_k 안에 warn이라도 있으면 거기서 종료 —
+    8조합 전수 풀 실행 대비 통상 4~8배 빠르다. 전부 실패하면 나머지 후보도
+    순서대로 시도(구버전과 동일한 커버리지 보장).
 
     Args:
         fixed_img: 고정상 RGB 배열.
@@ -895,62 +617,76 @@ def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
         moving_mask: 이동상 마스크 uint8.
         anchor_points: [(fx, fy, mx, my), ...] 강제 대응점.
         progress_callback: ``fn(current, total, label)`` 형태의 진행 콜백.
+        cfg: 파이프라인 설정.
 
     Returns:
         결과 리스트 (단일 entry — 최적 orientation 결과).
     """
     h, w = moving_img.shape[:2]
     rank = {'pass': 2, 'warn': 1, 'fail': 0}
+    total = 8
+
+    if progress_callback is not None:
+        try:
+            progress_callback(0, total, "프리스크린")
+        except Exception:
+            pass
+
+    print(f"\n[Lazy] 저해상({cfg.lazy_prescreen_side}px) 프리스크리닝 8조합...")
+    ranked = _prescreen_orientations(
+        fixed_img, moving_img, fixed_mask, moving_mask, cfg=cfg)
 
     best_entry = None
     best_score = (-1, -1)
     best_label = None
     attempts = []
-    total = 8
-    cur = 0
 
-    for flip in (False, True):
-        for k in range(4):
-            cur += 1
-            label = f"{'F' if flip else ''}R{k * 90}"
-            if progress_callback is not None:
-                try:
-                    progress_callback(cur, total, label)
-                except Exception:
-                    pass
-            print(f"\n{'#'*50}")
-            print(f"[Lazy {cur}/{total}] orientation: flip={flip} "
-                  f"rot={k * 90}° ({label})")
-            print(f"{'#'*50}")
-
-            m_t = _apply_orientation(moving_img, flip, k)
-            mmask_t = _apply_orientation(moving_mask, flip, k)
-            anchors_t = _transform_anchors_orient(
-                anchor_points, w, h, flip, k)
-
+    for cur, (pre_score, flip, k, label) in enumerate(ranked, start=1):
+        if progress_callback is not None:
             try:
-                results = register_test(
-                    fixed_img, m_t, fixed_mask, mmask_t,
-                    anchor_points=anchors_t)
-            except Exception as e:
-                print(f"[Lazy] {label} 실패: {e}")
-                continue
+                progress_callback(cur, total, label)
+            except Exception:
+                pass
+        print(f"\n{'#'*50}")
+        print(f"[Lazy {cur}/{total}] full run: flip={flip} rot={k * 90}° "
+              f"({label}, prescreen rank={pre_score[0]} inlier={pre_score[1]})")
+        print(f"{'#'*50}")
 
-            if not results:
-                continue
-            r = results[0]
-            r['lazy_orientation'] = (flip, k)
-            r['lazy_label'] = label
-            score = (rank.get(r['status'], 0),
-                     r.get('metrics', {}).get('n_inlier', 0))
-            attempts.append((label, r['status'], score[1]))
-            if score > best_score:
-                best_score = score
-                best_entry = r
-                best_label = label
+        m_t = _apply_orientation(moving_img, flip, k)
+        mmask_t = _apply_orientation(moving_mask, flip, k)
+        anchors_t = _transform_anchors_orient(anchor_points, w, h, flip, k)
+
+        try:
+            results = register_test(
+                fixed_img, m_t, fixed_mask, mmask_t,
+                anchor_points=anchors_t, cfg=cfg)
+        except Exception as e:
+            print(f"[Lazy] {label} 실패: {e}")
+            continue
+
+        if not results:
+            continue
+        r = results[0]
+        r['lazy_orientation'] = (flip, k)
+        r['lazy_label'] = label
+        score = (rank.get(r['status'], 0),
+                 r.get('metrics', {}).get('n_inlier', 0))
+        attempts.append((label, r['status'], score[1]))
+        if score > best_score:
+            best_score = score
+            best_entry = r
+            best_label = label
+
+        # 조기 종료: pass면 즉시, top_k 소진 시 warn 이상이면 종료
+        if best_score[0] == 2:
+            print(f"[Lazy] {label} PASS → 조기 종료")
+            break
+        if cur >= cfg.lazy_top_k and best_score[0] >= 1:
+            print(f"[Lazy] top-{cfg.lazy_top_k} 내 WARN 확보 → 조기 종료")
+            break
 
     print(f"\n{'='*60}")
-    print(f"[Lazy] Tried {len(attempts)} orientations:")
+    print(f"[Lazy] Tried {len(attempts)}/{total} orientations (프리스크린 순):")
     for lbl, st, ni in attempts:
         marker = " ★" if lbl == best_label else ""
         print(f"  {lbl}: {st.upper()}  inlier={ni}{marker}")

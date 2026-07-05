@@ -8,6 +8,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from config import DEFAULT, AffineGate, SimilarityGate
+
 
 def compose_full_matrix(M_loftr_2x3: np.ndarray,
                          M_rot_f: np.ndarray,
@@ -61,7 +63,8 @@ def compose_full_matrix(M_loftr_2x3: np.ndarray,
 def quality_gate_similarity(
         kpts_f: np.ndarray, kpts_m: np.ndarray,
         M_2x3: np.ndarray, inliers: np.ndarray,
-        tooth_mask_area: float) -> tuple[str, dict]:
+        tooth_mask_area: float,
+        cfg: SimilarityGate | None = None) -> tuple[str, dict]:
     """Similarity 변환 품질 판정 (pass/warn/fail).
 
     Args:
@@ -70,10 +73,12 @@ def quality_gate_similarity(
         M_2x3: Similarity 변환 행렬 (2×3).
         inliers: RANSAC inlier 마스크.
         tooth_mask_area: 치아 마스크 면적.
+        cfg: 게이트 임계값 (기본 normal 프로필).
 
     Returns:
         (status, metrics) 튜플.
     """
+    cfg = cfg or DEFAULT.sim_gate
     n_total = len(kpts_f)
     if inliers is None:
         return 'fail', {'n_total': n_total, 'n_inlier': 0, 'inlier_ratio': 0.0,
@@ -120,26 +125,26 @@ def quality_gate_similarity(
     }
 
     # Hard fail
-    if n_inlier < 12:
+    if n_inlier < cfg.min_inlier_fail:
         return 'fail', metrics
 
     hard_fail = (
         det <= 0 or
-        reproj_median >= 5.0 or
-        reproj_p90 >= 12.0 or
-        scale < 0.7 or scale > 1.4 or
-        abs(rotation) > 20
+        reproj_median >= cfg.reproj_median_fail or
+        reproj_p90 >= cfg.reproj_p90_fail or
+        scale < cfg.scale_fail[0] or scale > cfg.scale_fail[1] or
+        abs(rotation) > cfg.rotation_fail_deg
     )
     if hard_fail:
         return 'fail', metrics
 
     # Warn
     warn = (
-        n_inlier < 30 or
-        reproj_median >= 3.0 or
-        coverage < 0.2 or
-        scale < 0.8 or scale > 1.2 or
-        abs(rotation) > 15
+        n_inlier < cfg.min_inlier_warn or
+        reproj_median >= cfg.reproj_median_warn or
+        coverage < cfg.coverage_warn or
+        scale < cfg.scale_warn[0] or scale > cfg.scale_warn[1] or
+        abs(rotation) > cfg.rotation_warn_deg
     )
     if warn:
         return 'warn', metrics
@@ -150,7 +155,8 @@ def quality_gate_similarity(
 def quality_gate_affine(
         kpts_f: np.ndarray, kpts_m: np.ndarray,
         M_2x3: np.ndarray, inliers: np.ndarray,
-        tooth_mask_area: float) -> tuple[str, dict]:
+        tooth_mask_area: float,
+        cfg: AffineGate | None = None) -> tuple[str, dict]:
     """Affine 변환 품질 판정. scale/rotation 체크 없음.
 
     Args:
@@ -159,10 +165,12 @@ def quality_gate_affine(
         M_2x3: Affine 변환 행렬 (2×3).
         inliers: RANSAC inlier 마스크.
         tooth_mask_area: 치아 마스크 면적.
+        cfg: 게이트 임계값 (기본 normal 프로필).
 
     Returns:
         (status, metrics) 튜플.
     """
+    cfg = cfg or DEFAULT.aff_gate
     n_total = len(kpts_f)
     if inliers is None:
         return 'fail', {'n_total': n_total, 'n_inlier': 0, 'inlier_ratio': 0.0,
@@ -196,8 +204,9 @@ def quality_gate_affine(
         'det': float(det),
     }
 
-    if n_inlier < 12 or det <= 0 or reproj_median >= 5.0:
+    if n_inlier < cfg.min_inlier_fail or det <= 0 \
+            or reproj_median >= cfg.reproj_median_fail:
         return 'fail', metrics
-    if coverage < 0.15:
+    if coverage < cfg.coverage_warn:
         return 'warn', metrics
     return 'pass', metrics

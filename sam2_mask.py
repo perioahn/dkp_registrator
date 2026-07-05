@@ -66,13 +66,78 @@ def load_sam2_predictor(
     global _sam2_predictor
     if _sam2_predictor is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        _sam2_predictor = SAM2ImagePredictor.from_pretrained(
-            model_name,
-            device=device,
-            max_hole_area=max_hole_area,
-            max_sprinkle_area=max_sprinkle_area,
-        )
+        try:
+            _sam2_predictor = SAM2ImagePredictor.from_pretrained(
+                model_name,
+                device=device,
+                max_hole_area=max_hole_area,
+                max_sprinkle_area=max_sprinkle_area,
+            )
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            # GPU 메모리 부족/드라이버 문제 → CPU로 재시도 (크래시 방지)
+            if device == "cpu":
+                raise
+            print("[WARN] SAM2 GPU 로드 실패 - CPU로 재시도")
+            torch.cuda.empty_cache()
+            _sam2_predictor = SAM2ImagePredictor.from_pretrained(
+                model_name,
+                device="cpu",
+                max_hole_area=max_hole_area,
+                max_sprinkle_area=max_sprinkle_area,
+            )
     return _sam2_predictor
+
+
+def _sam_to_cpu(sam: SAM2ImagePredictor) -> None:
+    """CUDA OOM 시 SAM2 모델을 CPU로 이동한다 (기존 GPU 피처 캐시는 무효)."""
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    sam.model.to("cpu")
+    if hasattr(sam, "device"):
+        sam.device = torch.device("cpu")
+    print("[WARN] SAM2 CUDA OOM - CPU 폴백 (이후 마스크 선택은 느려질 수 있음)")
+
+
+def sam_set_image(sam: SAM2ImagePredictor, image_rgb: np.ndarray,
+                  feat_cache: dict | None = None) -> None:
+    """OOM 안전 set_image. OOM 시 CPU 폴백 후 재시도.
+
+    Args:
+        sam: SAM2 predictor.
+        image_rgb: RGB 배열.
+        feat_cache: 셀렉터의 피처 캐시 — CPU 폴백 시 GPU 텐서가 무효라 비운다.
+    """
+    try:
+        with torch.inference_mode():
+            sam.set_image(image_rgb)
+    except torch.cuda.OutOfMemoryError:
+        _sam_to_cpu(sam)
+        if feat_cache is not None:
+            feat_cache.clear()
+        with torch.inference_mode():
+            sam.set_image(image_rgb)
+
+
+def sam_predict(sam: SAM2ImagePredictor, image_rgb: np.ndarray,
+                point_coords: np.ndarray, point_labels: np.ndarray,
+                feat_cache: dict | None = None):
+    """OOM 안전 predict. OOM 시 CPU 폴백 + 현재 이미지 재인코딩 후 재시도."""
+    try:
+        with torch.inference_mode():
+            return sam.predict(point_coords=point_coords,
+                               point_labels=point_labels,
+                               multimask_output=True)
+    except torch.cuda.OutOfMemoryError:
+        _sam_to_cpu(sam)
+        if feat_cache is not None:
+            feat_cache.clear()
+        with torch.inference_mode():
+            sam.set_image(image_rgb)
+            return sam.predict(point_coords=point_coords,
+                               point_labels=point_labels,
+                               multimask_output=True)
 
 
 # ── interactive mask selector (per-object) ───────
@@ -144,8 +209,7 @@ class MaskSelector:
             self.bg.clear()
             self.current_mask = None
             self.confirmed.clear()
-            with torch.inference_mode():
-                self.sam.set_image(self.image_rgb)
+            sam_set_image(self.sam, self.image_rgb)
             self._redraw()
         elif key in ("q", "ㅂ"):
             self.done = True
@@ -158,10 +222,7 @@ class MaskSelector:
             return
         pts = np.array(self.fg + self.bg, dtype=np.float32)
         lbl = np.array([1] * len(self.fg) + [0] * len(self.bg), dtype=np.int32)
-        with torch.inference_mode():
-            masks, scores, _ = self.sam.predict(
-                point_coords=pts, point_labels=lbl, multimask_output=True
-            )
+        masks, scores, _ = sam_predict(self.sam, self.image_rgb, pts, lbl)
         best = np.argmax(scores)
         self.current_mask = masks[best].astype(bool)
         self._redraw()
@@ -219,8 +280,7 @@ class MaskSelector:
         Returns:
             확정된 마스크의 union (bool 배열) 또는 취소 시 None.
         """
-        with torch.inference_mode():
-            self.sam.set_image(self.image_rgb)
+        sam_set_image(self.sam, self.image_rgb)
         self.fig, self.ax = plt.subplots(1, 1, figsize=(12, 8))
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
@@ -282,8 +342,7 @@ class DualMaskSelector:
         self._feat_cache: dict[int, tuple] = {}
         # 모든 이미지 미리 인코딩
         for idx, img in enumerate(self.images):
-            with torch.inference_mode():
-                self.sam.set_image(img)
+            sam_set_image(self.sam, img, feat_cache=self._feat_cache)
             self._feat_cache[idx] = (
                 self.sam._features, self.sam._orig_hw)
         self._last_set = len(self.images) - 1
@@ -344,8 +403,7 @@ class DualMaskSelector:
             self.current_mask[i] = None
             self.confirmed[i].clear()
             self._feat_cache.pop(i, None)
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
+            sam_set_image(self.sam, self.images[i], feat_cache=self._feat_cache)
             self._feat_cache[i] = (
                 self.sam._features, self.sam._orig_hw)
             self._last_set = i
@@ -366,8 +424,7 @@ class DualMaskSelector:
             self.sam._features, self.sam._orig_hw = self._feat_cache[i]
             self.sam._is_image_set = True
         else:
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
+            sam_set_image(self.sam, self.images[i], feat_cache=self._feat_cache)
             self._feat_cache[i] = (
                 self.sam._features, self.sam._orig_hw)
         self._last_set = i
@@ -380,9 +437,8 @@ class DualMaskSelector:
         pts = np.array(self.fg[i] + self.bg[i], dtype=np.float32)
         lbl = np.array([1] * len(self.fg[i]) + [0] * len(self.bg[i]),
                         dtype=np.int32)
-        with torch.inference_mode():
-            masks, scores, _ = self.sam.predict(
-                point_coords=pts, point_labels=lbl, multimask_output=True)
+        masks, scores, _ = sam_predict(self.sam, self.images[i], pts, lbl,
+                                       feat_cache=self._feat_cache)
         best = np.argmax(scores)
         self.current_mask[i] = masks[best].astype(bool)
         self._redraw()
@@ -457,8 +513,7 @@ class DualMaskSelector:
         Returns:
             (fixed_mask, moving_mask) 튜플. 각각 bool 배열 또는 None.
         """
-        with torch.inference_mode():
-            self.sam.set_image(self.images[0])
+        sam_set_image(self.sam, self.images[0], feat_cache=self._feat_cache)
         self._last_set = 0
         self.fig, self.axes = plt.subplots(1, 2, figsize=(20, 8))
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
@@ -539,8 +594,7 @@ class MultiMaskSelector:
         self._feat_cache: dict[int, tuple] = {}
         # 모든 이미지 미리 인코딩
         for idx, img in enumerate(self.images):
-            with torch.inference_mode():
-                self.sam.set_image(img)
+            sam_set_image(self.sam, img, feat_cache=self._feat_cache)
             self._feat_cache[idx] = (
                 self.sam._features, self.sam._orig_hw)
         self._last_set = self.n - 1
@@ -665,8 +719,7 @@ class MultiMaskSelector:
             self.current_mask[i] = None
             self.confirmed[i].clear()
             self._feat_cache.pop(i, None)
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
+            sam_set_image(self.sam, self.images[i], feat_cache=self._feat_cache)
             self._feat_cache[i] = (
                 self.sam._features, self.sam._orig_hw)
             self._last_set = i
@@ -700,8 +753,7 @@ class MultiMaskSelector:
             self.sam._features, self.sam._orig_hw = self._feat_cache[i]
             self.sam._is_image_set = True
         else:
-            with torch.inference_mode():
-                self.sam.set_image(self.images[i])
+            sam_set_image(self.sam, self.images[i], feat_cache=self._feat_cache)
             self._feat_cache[i] = (
                 self.sam._features, self.sam._orig_hw)
         self._last_set = i
@@ -714,9 +766,8 @@ class MultiMaskSelector:
         pts = np.array(self.fg[i] + self.bg[i], dtype=np.float32)
         lbl = np.array([1] * len(self.fg[i]) + [0] * len(self.bg[i]),
                         dtype=np.int32)
-        with torch.inference_mode():
-            masks, scores, _ = self.sam.predict(
-                point_coords=pts, point_labels=lbl, multimask_output=True)
+        masks, scores, _ = sam_predict(self.sam, self.images[i], pts, lbl,
+                                       feat_cache=self._feat_cache)
         best = np.argmax(scores)
         self.current_mask[i] = masks[best].astype(bool)
         self._redraw()
@@ -836,8 +887,7 @@ class MultiMaskSelector:
         Returns:
             N개 마스크의 리스트. 각각 bool 배열 또는 None.
         """
-        with torch.inference_mode():
-            self.sam.set_image(self.images[0])
+        sam_set_image(self.sam, self.images[0], feat_cache=self._feat_cache)
         self._last_set = 0
         rows, cols = self._grid_layout()
         fig_w = min(7 * cols, 28)
