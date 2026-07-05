@@ -49,6 +49,28 @@
 pip install torch torchvision kornia opencv-python numpy Pillow matplotlib
 ```
 
+## GPU(CUDA) 지원
+
+**CUDA가 없어도 동작합니다.** 실행 시 GPU를 자동 감지하며, 없으면 CPU로 전환됩니다:
+
+- SAM2 마스크: `cuda` 사용 가능 여부를 자동 감지 (`sam2_mask.py`)
+- LoFTR 매칭: GPU가 있을 때만 GPU 사용, **GPU 메모리 부족(OOM) 시 CPU로 자동 폴백** 후 다음 작업에서 GPU 복귀 (`matching.py`)
+
+| 환경 | 동작 | 체감 |
+|---|---|---|
+| NVIDIA GPU + CUDA torch | GPU 가속 | 마스크·매칭 빠름 |
+| GPU 없음 / CPU torch | 자동 CPU 모드 | 동일 결과, 수 배 느림 (tiny 모델이라 사용 가능한 수준) |
+| GPU 메모리 부족 | 해당 작업만 CPU 폴백 | 중단 없음 |
+
+GPU 가속을 쓰려면 CUDA 버전에 맞는 PyTorch를 설치하세요 (예: CUDA 12.x):
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+기본 `pip install torch`(CPU 전용 빌드)로도 기능상 문제는 없습니다.
+Releases의 빌드 실행파일은 CPU 빌드 기준이라 어느 PC에서든 돌아갑니다.
+
 ## 실행
 
 ```bash
