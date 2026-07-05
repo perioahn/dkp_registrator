@@ -543,6 +543,7 @@ if DIST:
 
 def main():
     import argparse
+    import urllib.request
     import webbrowser
 
     ap = argparse.ArgumentParser()
@@ -551,6 +552,16 @@ def main():
     ap.add_argument("--persist", action="store_true",
                     help="브라우저를 닫아도 서버 유지 (개발용)")
     args = ap.parse_args()
+
+    # 이미 실행 중이면 새로 띄우지 않고 브라우저만 (포트 충돌로 옛 세션이 보이는 문제 방지)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/api/state", timeout=2):
+            print("이미 실행 중 - 브라우저만 엽니다")
+            if not args.no_browser:
+                webbrowser.open(f"http://127.0.0.1:{args.port}/")
+            return
+    except Exception:
+        pass
     if not args.persist:
         threading.Thread(target=_auto_shutdown_loop, daemon=True,
                          name="auto-exit").start()
