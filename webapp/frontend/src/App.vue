@@ -89,6 +89,8 @@ function badge(r: ImgInfo['result']): { text: string; cls: string } | null {
 
 onMounted(() => {
   refresh()
+  // 서버 재시작 등으로 낡아진 브라우저 상태 방지 (Register 409 예방)
+  window.addEventListener('focus', refresh)
   es = new EventSource('/api/events')
   es.addEventListener('register', (e) => {
     const d = JSON.parse((e as MessageEvent).data)
@@ -141,7 +143,7 @@ onUnmounted(() => es?.close())
             </div>
             <div class="img-sub">
               <span :class="{ 'mask-ok': img.mask_ready }">
-                {{ img.mask_ready ? `마스크 ${img.n_objects || '작업중'}` : '마스크 필요' }}
+                {{ img.mask_ready ? '마스크 ✓' : '마스크 필요' }}
               </span>
               <span v-if="badge(img.result)" class="badge" :class="badge(img.result)!.cls">
                 {{ badge(img.result)!.text }}
@@ -163,9 +165,13 @@ onUnmounted(() => es?.close())
             <option v-for="p in profiles" :key="p" :value="p">{{ p }}</option>
           </select>
         </label>
-        <button class="register-btn" :disabled="!canRegister" @click="startRegister">
+        <button class="register-btn" :disabled="!canRegister" @click="startRegister"
+                :title="canRegister ? '' : '기준과 Moving 각각 마스크를 지정해야 실행됩니다'">
           {{ running ? '정합 중…' : '▶ Register' }}
         </button>
+        <div v-if="!canRegister && !running && images.length" class="statusmsg">
+          기준 + Moving에 마스크를 지정하면 활성화됩니다
+        </div>
         <div class="statusmsg">{{ msg }}</div>
       </div>
     </aside>

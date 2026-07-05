@@ -61,7 +61,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
     <div class="toolbar">
       <span class="tip">좌클릭 = 포함 · 우클릭 = 제외 · 개체 확정 후 다음 개체 진행</span>
       <span class="spacer" />
-      <span class="obj-count">확정 개체 {{ nObjects }}</span>
+      <span v-if="nObjects > 0" class="obj-count">마스크 ✓</span>
       <button :disabled="busy" @click="action('confirm')">✓ 개체 확정 (Z)</button>
       <button :disabled="busy" @click="action('undo')">↶ 실행취소</button>
       <button :disabled="busy" class="danger" @click="action('reset')">✕ 초기화 (X)</button>

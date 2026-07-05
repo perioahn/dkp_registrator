@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { fcOpacity, mode, wipe, type ViewMode } from '../viewstate'
 
 const props = defineProps<{
   img: {
@@ -12,9 +13,7 @@ const props = defineProps<{
   }
 }>()
 
-const mode = ref<'wipe' | 'false' | 'flicker' | 'side' | 'match'>('wipe')
-const wipe = ref(50)
-const fcOpacity = ref(70)
+// mode/wipe/fcOpacity는 viewstate 모듈 — 다른 Moving을 선택해도 보기 방식 유지
 const flickOn = ref(true)
 let flickTimer: number | undefined
 
@@ -26,6 +25,11 @@ let dragging = false
 let lastX = 0
 let lastY = 0
 
+const stackedEl = ref<HTMLElement | null>(null)
+const baseImgEl = ref<HTMLImageElement | null>(null)
+// 와이프 경계선: 이미지 표시 영역 기준 (컨테이너 아님 — 경계와 속도 일치)
+const lineBox = ref({ left: 0, top: 0, height: 0 })
+
 const r = computed(() => props.img.result!)
 const fixedUrl = computed(() => `/api/result/${props.img.id}/fixed`)
 const regUrl = computed(() => `/api/result/${props.img.id}/registered`)
@@ -34,6 +38,19 @@ const matchUrl = computed(() => `/api/result/${props.img.id}/match_viz`)
 
 const transform = computed(() =>
   `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`)
+
+function updateLine() {
+  const img = baseImgEl.value
+  const box = stackedEl.value
+  if (!img || !box) return
+  const ir = img.getBoundingClientRect()
+  const br = box.getBoundingClientRect()
+  lineBox.value = {
+    left: ir.left - br.left + (wipe.value / 100) * ir.width,
+    top: ir.top - br.top,
+    height: ir.height,
+  }
+}
 
 function onWheel(e: WheelEvent) {
   e.preventDefault()
@@ -50,14 +67,21 @@ function onMove(e: MouseEvent) {
 function onUp() { dragging = false }
 function resetView() { zoom.value = 1; panX.value = 0; panY.value = 0 }
 
-function setMode(m: typeof mode.value) {
-  mode.value = m
-  if (m === 'flicker') {
-    flickTimer = window.setInterval(() => (flickOn.value = !flickOn.value), 600)
-  } else if (flickTimer) {
+function stopFlicker() {
+  if (flickTimer) {
     clearInterval(flickTimer)
     flickTimer = undefined
   }
+}
+function startFlicker() {
+  stopFlicker()
+  flickTimer = window.setInterval(() => (flickOn.value = !flickOn.value), 600)
+}
+
+function setMode(m: ViewMode) {
+  mode.value = m
+  if (m === 'flicker') startFlicker()
+  else stopFlicker()
 }
 
 const badgeCls = computed(() =>
@@ -71,10 +95,18 @@ const failText = computed(() => {
   return reason
 })
 
-onMounted(() => document.addEventListener('mouseup', onUp))
+watch([wipe, zoom, panX, panY, mode], () => nextTick(updateLine))
+
+onMounted(() => {
+  document.addEventListener('mouseup', onUp)
+  window.addEventListener('resize', updateLine)
+  if (mode.value === 'flicker') startFlicker() // 유지된 모드 복원
+  nextTick(updateLine)
+})
 onUnmounted(() => {
   document.removeEventListener('mouseup', onUp)
-  if (flickTimer) clearInterval(flickTimer)
+  window.removeEventListener('resize', updateLine)
+  stopFlicker()
 })
 </script>
 
@@ -96,14 +128,14 @@ onUnmounted(() => {
 
     <template v-if="r.status !== 'fail'">
       <div class="mode-tabs sub">
-        <button :class="{ on: mode === 'wipe' }" @click="setMode('wipe')">와이프</button>
+        <button :class="{ on: mode === 'wipe' }" @click="setMode('wipe')">Wipe</button>
         <button :class="{ on: mode === 'false' }" @click="setMode('false')">False color</button>
-        <button :class="{ on: mode === 'flicker' }" @click="setMode('flicker')">플리커</button>
-        <button :class="{ on: mode === 'side' }" @click="setMode('side')">나란히</button>
-        <button :class="{ on: mode === 'match' }" @click="setMode('match')">매칭점</button>
+        <button :class="{ on: mode === 'flicker' }" @click="setMode('flicker')">Flicker</button>
+        <button :class="{ on: mode === 'side' }" @click="setMode('side')">Side by side</button>
+        <button :class="{ on: mode === 'match' }" @click="setMode('match')">Matches</button>
         <span class="spacer" />
         <label v-if="mode === 'wipe'" class="slider-label">
-          기준 ◀ <input v-model.number="wipe" type="range" min="0" max="100" /> ▶ 정합
+          Fixed ◀ <input v-model.number="wipe" type="range" min="0" max="100" /> ▶ Moving
         </label>
         <label v-if="mode === 'false'" class="slider-label">
           투명도 <input v-model.number="fcOpacity" type="range" min="0" max="100" />
@@ -118,14 +150,14 @@ onUnmounted(() => {
         @mousemove="onMove"
       >
         <div v-if="mode === 'side'" class="side-by-side">
-          <div class="pane"><img :src="fixedUrl" :style="{ transform }" /><span>기준</span></div>
-          <div class="pane"><img :src="regUrl" :style="{ transform }" /><span>정합</span></div>
+          <div class="pane"><img :src="fixedUrl" :style="{ transform }" /><span>Fixed</span></div>
+          <div class="pane"><img :src="regUrl" :style="{ transform }" /><span>Moving (registered)</span></div>
         </div>
         <div v-else-if="mode === 'match'" class="single">
           <img :src="matchUrl" :style="{ transform }" />
         </div>
-        <div v-else class="stacked">
-          <img :src="fixedUrl" :style="{ transform }" />
+        <div v-else ref="stackedEl" class="stacked">
+          <img ref="baseImgEl" :src="fixedUrl" :style="{ transform }" @load="updateLine" />
           <img
             v-if="mode === 'wipe'"
             :src="regUrl"
@@ -135,7 +167,9 @@ onUnmounted(() => {
                :style="{ transform, opacity: fcOpacity / 100 }" />
           <img v-else-if="mode === 'flicker'" :src="regUrl"
                :style="{ transform, opacity: flickOn ? 1 : 0 }" />
-          <div v-if="mode === 'wipe'" class="wipe-line" :style="{ left: wipe + '%' }" />
+          <div v-if="mode === 'wipe'" class="wipe-line"
+               :style="{ left: lineBox.left + 'px', top: lineBox.top + 'px',
+                         height: lineBox.height + 'px' }" />
         </div>
       </div>
     </template>
