@@ -59,12 +59,21 @@ function onWheel(e: WheelEvent) {
 }
 function onDown(e: MouseEvent) { dragging = true; lastX = e.clientX; lastY = e.clientY }
 function onMove(e: MouseEvent) {
+  if (wipeDragging) {
+    const ir = baseImgEl.value?.getBoundingClientRect()
+    if (ir?.width) wipe.value = Math.min(100, Math.max(0, ((e.clientX - ir.left) / ir.width) * 100))
+    return
+  }
   if (!dragging) return
   panX.value += e.clientX - lastX
   panY.value += e.clientY - lastY
   lastX = e.clientX; lastY = e.clientY
 }
-function onUp() { dragging = false }
+function onUp() { dragging = false; wipeDragging = false }
+
+// 와이프 선 가운데 핸들 드래그
+let wipeDragging = false
+function onHandleDown() { wipeDragging = true }
 function resetView() { zoom.value = 1; panX.value = 0; panY.value = 0 }
 
 function stopFlicker() {
@@ -169,7 +178,9 @@ onUnmounted(() => {
                :style="{ transform, opacity: flickOn ? 1 : 0 }" />
           <div v-if="mode === 'wipe'" class="wipe-line"
                :style="{ left: lineBox.left + 'px', top: lineBox.top + 'px',
-                         height: lineBox.height + 'px' }" />
+                         height: lineBox.height + 'px' }">
+            <div class="wipe-handle" @mousedown.stop.prevent="onHandleDown">◀ ▶</div>
+          </div>
         </div>
       </div>
     </template>
