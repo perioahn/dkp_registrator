@@ -37,6 +37,20 @@
 - **Matches**: 키포인트 매칭 시각화 (녹색=inlier, 빨간=outlier)
 - 기본 파일명: `Fixed이름_R_Moving이름.jpg`
 
+## 웹 UI (신규)
+
+브라우저 기반 UI — tkinter GUI와 동일한 엔진을 사용합니다.
+
+```bash
+python webapp/server.py        # http://127.0.0.1:8790 자동 오픈
+```
+
+1. 기준(Fixed) 1장 + Moving 여러 장 업로드
+2. 각 이미지에서 치아 **좌클릭=포함 / 우클릭=제외**, [개체 확정(Z)]으로 다음 개체
+3. ▶ Register (Lazy 토글, normal/strict/relaxed 프로필 선택 가능)
+4. 결과: 품질 배지(PASS/WARN/FAIL+사유) + 와이프 슬라이더 / False color /
+   플리커 / 나란히 / 매칭점 보기, 휠 줌·드래그 팬, 💾 저장
+
 ## 요구 환경
 
 - Python 3.10+
