@@ -76,11 +76,15 @@ pip install torch torchvision kornia opencv-python numpy Pillow matplotlib
 | GPU 없음 / CPU torch | 자동 CPU 모드 | 동일 결과, 수 배 느림 (tiny 모델이라 사용 가능한 수준) |
 | GPU 메모리 부족 | 해당 작업만 CPU 폴백 | 중단 없음 |
 
-GPU 가속을 쓰려면 CUDA 버전에 맞는 PyTorch를 설치하세요 (예: CUDA 12.x):
+GPU 가속을 쓰려면 CUDA 빌드 PyTorch를 설치하세요:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
+
+CUDA 툴킷을 따로 설치할 필요는 없습니다 — PyTorch 휠에 CUDA 런타임이 내장되어 있어
+**NVIDIA 드라이버만 최신이면**(cu121 기준 525 이상) 동작합니다.
+다른 CUDA 계열 휠(cu124 등)을 쓰려면 [pytorch.org](https://pytorch.org/get-started/locally/) 안내를 따르세요.
 
 기본 `pip install torch`(CPU 전용 빌드)로도 기능상 문제는 없습니다.
 Releases의 빌드 실행파일은 CPU 빌드 기준이라 어느 PC에서든 돌아갑니다.
