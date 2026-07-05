@@ -88,6 +88,13 @@ def load_sam2_predictor(
     return _sam2_predictor
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """CUDA OOM 판별 — torch는 OutOfMemoryError 또는 RuntimeError로 올린다."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 def _sam_to_cpu(sam: SAM2ImagePredictor) -> None:
     """CUDA OOM 시 SAM2 모델을 CPU로 이동한다 (기존 GPU 피처 캐시는 무효)."""
     try:
@@ -112,7 +119,9 @@ def sam_set_image(sam: SAM2ImagePredictor, image_rgb: np.ndarray,
     try:
         with torch.inference_mode():
             sam.set_image(image_rgb)
-    except torch.cuda.OutOfMemoryError:
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if not _is_cuda_oom(e):
+            raise
         _sam_to_cpu(sam)
         if feat_cache is not None:
             feat_cache.clear()
@@ -129,7 +138,9 @@ def sam_predict(sam: SAM2ImagePredictor, image_rgb: np.ndarray,
             return sam.predict(point_coords=point_coords,
                                point_labels=point_labels,
                                multimask_output=True)
-    except torch.cuda.OutOfMemoryError:
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if not _is_cuda_oom(e):
+            raise
         _sam_to_cpu(sam)
         if feat_cache is not None:
             feat_cache.clear()

@@ -155,5 +155,19 @@ def test_lazy_prescreen_early_stop(monkeypatch):
     r = results[0]
     assert r['status'] in ('pass', 'warn')
     assert r['lazy_orientation'] == (False, 2), r.get('lazy_label')
-    # 8조합 전수 실행이 아니라 조기 종료했는지
-    assert len(calls) <= DEFAULT.lazy_top_k, f"full runs: {len(calls)}"
+    # pass 조기 종료: 8조합 전수가 아니라 프리스크린 상위에서 끝나야 함
+    assert len(calls) <= 2, f"full runs: {len(calls)}"
+
+
+@pytest.mark.slow
+def test_register_pair_wrapper():
+    """하위호환 register_pair가 구 반환 포맷을 유지하는지."""
+    from register import register_pair
+    fixed = _textured_image(seed=3)
+    moving, _ = _warp_similarity(fixed, deg=4.0, scale=1.0, tx=8, ty=6)
+    mask = np.full(fixed.shape[:2], 255, dtype=np.uint8)
+    r = register_pair(fixed, moving, mask, mask, refine=True, hint=(0.2, 640))
+    assert set(r) == {'registered_img', 'M_full', 'metrics', 'path', 'debug_images'}
+    assert r['path'] in ('similarity', 'affine')
+    assert r['metrics']['status'] in ('pass', 'warn')
+    assert r['registered_img'] is not None

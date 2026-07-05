@@ -606,9 +606,9 @@ def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
     """Lazy 모드: 8가지 회전/flip 조합 중 최적 orientation으로 정합.
 
     저해상 프리스크리닝으로 8조합을 점수화한 뒤, 상위 후보부터 풀 파이프라인
-    실행. pass가 나오면 즉시 종료, top_k 안에 warn이라도 있으면 거기서 종료 —
-    8조합 전수 풀 실행 대비 통상 4~8배 빠르다. 전부 실패하면 나머지 후보도
-    순서대로 시도(구버전과 동일한 커버리지 보장).
+    실행. pass가 나오면 즉시 종료 — 올바른 orientation이 통상 1순위라 8조합
+    전수 풀 실행 대비 4~8배 빠르다. pass가 안 나오면 8조합을 모두 시도하고
+    최고점을 반환한다(구버전과 동일한 커버리지).
 
     Args:
         fixed_img: 고정상 RGB 배열.
@@ -677,12 +677,10 @@ def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
             best_entry = r
             best_label = label
 
-        # 조기 종료: pass면 즉시, top_k 소진 시 warn 이상이면 종료
+        # 조기 종료는 pass에서만 — warn은 뒤 orientation에서 pass가 나올 수
+        # 있으므로 전수 계속 (프리스크리닝은 실행 순서만 결정, 커버리지 동일)
         if best_score[0] == 2:
             print(f"[Lazy] {label} PASS → 조기 종료")
-            break
-        if cur >= cfg.lazy_top_k and best_score[0] >= 1:
-            print(f"[Lazy] top-{cfg.lazy_top_k} 내 WARN 확보 → 조기 종료")
             break
 
     print(f"\n{'='*60}")
@@ -700,6 +698,39 @@ def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
     orig_label = best_entry.get('label', '?')
     best_entry['label'] = f"{orig_label} [{best_label}]"
     return [best_entry]
+
+
+def register_pair(fixed_img: np.ndarray,
+                  moving_img: np.ndarray,
+                  fixed_mask: np.ndarray,
+                  moving_mask: np.ndarray,
+                  refine: bool = False,
+                  force_nocrop: bool = False,
+                  hint: tuple | None = None,
+                  cfg: PipelineConfig = DEFAULT) -> dict:
+    """(하위호환 wrapper) 구 단일패스 cascade API — 피라미드 엔진으로 위임.
+
+    refine/force_nocrop/hint는 구 API 호환을 위해 받되 무시된다
+    (피라미드 정합이 해당 케이스를 포괄).
+
+    Returns:
+        {'registered_img', 'M_full', 'metrics', 'path', 'debug_images'}
+    """
+    entry = register_test(fixed_img, moving_img, fixed_mask, moving_mask,
+                          cfg=cfg)[0]
+    metrics = dict(entry.get('metrics') or {})
+    metrics.setdefault('gate', entry.get('gate', 'none'))
+    metrics.setdefault('status', entry.get('status', 'fail'))
+    if entry.get('reason'):
+        metrics.setdefault('reason', entry['reason'])
+    failed = entry.get('registered_img') is None
+    return {
+        'registered_img': entry.get('registered_img'),
+        'M_full': entry.get('M_full'),
+        'metrics': metrics,
+        'path': 'failed' if failed else entry.get('gate', 'none'),
+        'debug_images': {'false_color': entry.get('false_color')},
+    }
 
 
 def false_color(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:

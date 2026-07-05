@@ -41,9 +41,8 @@ class PipelineConfig:
     mask_sigma: int = 5
     ransac_thresh: float = 3.0
     min_matches: int = 4
-    # Lazy 모드: 저해상 프리스크리닝 후 상위 조합만 풀 실행
+    # Lazy 모드: 저해상 프리스크리닝으로 8조합 실행 순서 결정 (pass 시 조기종료)
     lazy_prescreen_side: int = 320
-    lazy_top_k: int = 2
     sim_gate: SimilarityGate = SimilarityGate()
     aff_gate: AffineGate = AffineGate()
 
