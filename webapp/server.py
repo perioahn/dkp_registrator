@@ -34,7 +34,12 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 from config import PROFILES, get_profile  # noqa: E402
-from register import register_test, register_test_lazy  # noqa: E402
+from register import (  # noqa: E402
+    _apply_orientation,
+    false_color,
+    register_test,
+    register_test_lazy,
+)
 
 log = logging.getLogger(__name__)
 
@@ -288,6 +293,7 @@ def _result_summary(r: dict | None) -> dict | None:
         "n_inlier": m.get("n_inlier"), "inlier_ratio": m.get("inlier_ratio"),
         "reproj_median": m.get("reproj_median"),
         "rotation_deg": m.get("rotation_deg"), "scale": m.get("scale"),
+        "manual_adjusted": bool(r.get("manual_adjusted")),
     }
 
 
@@ -489,6 +495,49 @@ def result_image(mid: str, kind: str, max_side: int = 1600):
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                            [cv2.IMWRITE_JPEG_QUALITY, 90])
     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
+
+
+@app.post("/api/result/{mid}/adjust")
+def adjust_result(mid: str,
+                  dx: float = Body(default=0.0, embed=True),
+                  dy: float = Body(default=0.0, embed=True),
+                  scale: float = Body(default=1.0, embed=True),
+                  rot_deg: float = Body(default=0.0, embed=True),
+                  ref_w: float = Body(default=0.0, embed=True),
+                  reset: bool = Body(default=False, embed=True)) -> dict:
+    """수동 미세조정: fixed 중심 기준 delta similarity를 정합행렬에 합성.
+
+    dx/dy는 ref_w 폭 기준 픽셀 (ref_w=0이면 fixed 원본 픽셀).
+    rot_deg는 화면 기준 시계방향 +. reset=True면 자동 정합 행렬로 복원.
+    """
+    if SESSION.running:
+        raise HTTPException(409, "정합 실행 중")
+    r = SESSION.results.get(mid)
+    if not r or r.get("M_full") is None:
+        raise HTTPException(404, "결과 없음")
+    if "M_orig" not in r:
+        r["M_orig"] = np.array(r["M_full"], dtype=np.float64).copy()
+    fixed = get_full(SESSION.fixed_id())
+    h, w = fixed.shape[:2]
+    if reset:
+        new_M = r["M_orig"].copy()
+    else:
+        sc = w / ref_w if ref_w else 1.0
+        D = np.eye(3, dtype=np.float64)
+        # getRotationMatrix2D의 +각은 화면상 반시계 → 화면 시계방향 + 규약이라 부호 반전
+        D[:2] = cv2.getRotationMatrix2D((w / 2, h / 2), -rot_deg, scale)
+        D[0, 2] += dx * sc
+        D[1, 2] += dy * sc
+        new_M = D @ np.array(r["M_full"], dtype=np.float64)
+    flip, k = r.get("lazy_orientation", (False, 0))
+    m_src = _apply_orientation(get_full(mid), flip, k)
+    reg = cv2.warpAffine(m_src, new_M[:2, :], (w, h))
+    r["M_full"] = new_M
+    r["registered_img"] = reg
+    r["false_color"] = false_color(fixed, reg)
+    r["manual_adjusted"] = not np.allclose(new_M, r["M_orig"])
+    return {"ok": True, "manual_adjusted": r["manual_adjusted"],
+            "ts": time.time_ns()}
 
 
 @app.get("/api/result/{mid}/download")

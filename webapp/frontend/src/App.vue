@@ -10,7 +10,7 @@ interface ImgInfo {
   result: null | {
     status: string; gate: string; label: string; reason?: string
     n_inlier?: number; inlier_ratio?: number; reproj_median?: number
-    rotation_deg?: number; scale?: number
+    rotation_deg?: number; scale?: number; manual_adjusted?: boolean
   }
 }
 
@@ -184,7 +184,7 @@ onUnmounted(() => es?.close())
                   @click="viewMode = 'result'">결과</button>
         </div>
         <MaskEditor v-if="viewMode === 'mask'" :key="selected.id" :img="selected" @changed="refresh" />
-        <ResultViewer v-else-if="selected.result" :key="'r' + selected.id" :img="selected" />
+        <ResultViewer v-else-if="selected.result" :key="'r' + selected.id" :img="selected" @changed="refresh" />
       </template>
       <p v-else class="hint center">← 이미지를 업로드하세요</p>
     </main>
