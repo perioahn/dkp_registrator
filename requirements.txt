@@ -6,3 +6,8 @@ numpy
 Pillow
 matplotlib
 scikit-image
+sam2
+huggingface_hub
+fastapi
+uvicorn
+python-multipart

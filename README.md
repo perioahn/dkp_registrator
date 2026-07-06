@@ -51,17 +51,32 @@ python webapp/server.py        # http://127.0.0.1:8790 자동 오픈
 4. 결과: 품질 배지(PASS/WARN/FAIL+사유) + 와이프 슬라이더 / False color /
    플리커 / 나란히 / 매칭점 보기, 휠 줌·드래그 팬, 💾 저장
 
-## 요구 환경
+## 설치 A — 실행파일 (Python 불필요)
 
-- Python 3.10+
-- PyTorch, torchvision
-- kornia (LoFTR)
-- SAM2 (`sam2-hiera-tiny`, HuggingFace에서 자동 다운로드)
-- OpenCV, NumPy, Pillow, matplotlib
+[Releases](../../releases)에서 받기:
+- Windows: `DKPregistrator-Windows.zip` 압축 해제 → `DKPregistrator.exe` 실행
+- macOS: `DKPregistrator-macOS.zip` 압축 해제 → 앱 실행 (서명 안 된 앱이라 첫 실행은 우클릭 → 열기)
 
-```bash
-pip install torch torchvision kornia opencv-python numpy Pillow matplotlib
+## 설치 B — 소스 실행 (Python 3.10+ 설치된 PC)
+
+cmd(명령 프롬프트)에서 순서대로:
+
+```bat
+git clone https://github.com/perioahn/dkp_registrator
+cd dkp_registrator
+pip install -r requirements.txt
+python launcher.py
 ```
+
+git 없으면 초록 **Code → Download ZIP** 받아 압축 해제 후 그 폴더에서 `pip install ...`부터.
+`requirements.txt` 내용물 (개별 설치 시):
+
+```bat
+pip install torch torchvision kornia opencv-python-headless numpy Pillow matplotlib scikit-image sam2 huggingface_hub fastapi uvicorn python-multipart
+```
+
+- SAM2 모델 가중치(`sam2-hiera-tiny`)는 첫 실행 때 HuggingFace에서 자동 다운로드
+- 실행하면 브라우저에 웹 UI가 열림 (`python launcher.py --tk` = 구형 tkinter GUI)
 
 ## GPU(CUDA) 지원
 
