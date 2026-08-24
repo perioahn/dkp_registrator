@@ -78,31 +78,53 @@ pip install torch torchvision kornia opencv-python-headless numpy Pillow matplot
 - SAM2 모델 가중치(`sam2-hiera-tiny`)는 첫 실행 때 HuggingFace에서 자동 다운로드
 - 실행하면 브라우저에 웹 UI가 열림 (`python launcher.py --tk` = 구형 tkinter GUI)
 
-## GPU(CUDA) 지원
+## 정합 모델 — 비율 보존
 
-**CUDA가 없어도 동작합니다.** 실행 시 GPU를 자동 감지하며, 없으면 CPU로 전환됩니다:
+같은 악궁을 다른 날 찍은 사진의 실제 관계는 **similarity**(회전 + 균일 배율 + 평행이동)입니다.
+그래서 `normal`·`strict` 프로필은 similarity만 사용해 **가로세로 비율이 절대 왜곡되지 않습니다.**
+매칭이 부족하면 넓은 inlier 집합으로 similarity를 재적합해 구제하고, 그래도 안 되면 FAIL로 알립니다.
 
-- SAM2 마스크: `cuda` 사용 가능 여부를 자동 감지 (`sam2_mask.py`)
-- LoFTR 매칭: GPU가 있을 때만 GPU 사용, **GPU 메모리 부족(OOM) 시 CPU로 자동 폴백** 후 다음 작업에서 GPU 복귀 (`matching.py`)
+`relaxed` 프로필만 최후 수단으로 affine(전단·비등방 배율)을 허용하며, 이 경우 결과 화면에
+**⚠ affine (비율 왜곡 가능)** 배지가 표시됩니다.
 
-| 환경 | 동작 | 체감 |
-|---|---|---|
-| NVIDIA GPU + CUDA torch | GPU 가속 | 마스크·매칭 빠름 |
-| GPU 없음 / CPU torch | 자동 CPU 모드 | 동일 결과, 수 배 느림 (tiny 모델이라 사용 가능한 수준) |
-| GPU 메모리 부족 | 해당 작업만 CPU 폴백 | 중단 없음 |
+## GPU 가속
 
-GPU 가속을 쓰려면 CUDA 빌드 PyTorch를 설치하세요:
+**GPU가 없어도 동작합니다.** GPU가 있으면 큰 폭으로 빨라집니다 (실측, RTX 4080 기준):
+
+| 항목 | 속도 향상 |
+|---|---|
+| LoFTR 매칭 | **×16** |
+| SAM2 마스크 클릭 반응 | **×3.7** |
+| 정합 전체 체감 | **약 10배** |
+
+### Windows 실행파일
+
+실행파일에는 CPU용 PyTorch가 들어 있어 **어떤 PC에서도 받자마자 바로 실행**됩니다.
+NVIDIA GPU가 있으면 왼쪽 아래 **[⚡ GPU 가속 켜기]** 버튼이 나타나며, 누르면
+GPU용 PyTorch를 내려받아 설치합니다.
+
+- 다운로드 약 2.5GB (최초 1회 · 인터넷 필요) — 설치 중에도 앱은 계속 사용 가능
+- 설치가 끝나고 **앱을 다시 시작하면** GPU 가속이 적용됩니다
+- 설치에 실패해도 앱은 CPU로 그대로 동작합니다 (로그: `%LOCALAPPDATA%\DKPRegistrator\gpu_setup.log`)
+- CUDA 툴킷 설치는 불필요 — **NVIDIA 드라이버만 최신이면** 동작 (cu124 기준 525 이상)
+- GPU 메모리 부족(OOM) 시 해당 작업만 CPU로 자동 폴백 — 중단 없음
+- 되돌리려면 `%LOCALAPPDATA%\DKPRegistrator\cuda` 폴더를 삭제하면 CPU로 복귀
+
+### macOS
+
+Apple Silicon이면 **MPS(Metal) 가속이 자동 적용**됩니다 — 추가 설치 없음.
+(일부 미지원 연산은 CPU로 자동 폴백)
+
+### 소스 실행
+
+CUDA 빌드 PyTorch가 설치돼 있으면 자동으로 GPU를 사용합니다:
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
-CUDA 툴킷을 따로 설치할 필요는 없습니다 — PyTorch 휠에 CUDA 런타임이 내장되어 있어
-**NVIDIA 드라이버만 최신이면**(cu121 기준 525 이상) 동작합니다.
-다른 CUDA 계열 휠(cu124 등)을 쓰려면 [pytorch.org](https://pytorch.org/get-started/locally/) 안내를 따르세요.
-
 기본 `pip install torch`(CPU 전용 빌드)로도 기능상 문제는 없습니다.
-Releases의 빌드 실행파일은 CPU 빌드 기준이라 어느 PC에서든 돌아갑니다.
+다른 CUDA 계열 휠은 [pytorch.org](https://pytorch.org/get-started/locally/) 안내를 따르세요.
 
 ## 실행
 

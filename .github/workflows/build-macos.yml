@@ -38,6 +38,8 @@ jobs:
           pip install fastapi uvicorn python-multipart
           pip install pyinstaller
 
+      # CPU torch를 포함해 배포 — 어떤 PC에서도 즉시 실행된다.
+      # NVIDIA GPU가 있으면 앱 안의 [⚡ GPU 가속 켜기]로 CUDA torch를 선택 설치(gpu_setup.py).
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
         run: >
@@ -46,13 +48,23 @@ jobs:
           --hidden-import sam2 --hidden-import sam2.sam2_image_predictor
           --hidden-import sam2.modeling --hidden-import huggingface_hub
           --hidden-import main_gui
-          --collect-all kornia --collect-all sam2 --collect-all torch
+          --collect-all kornia --collect-all sam2
           --collect-all uvicorn
           --add-data "webapp/frontend/dist;webapp/frontend/dist"
           --add-data "webapp/folder_dialog.ps1;webapp"
           --exclude-module tensorboard --exclude-module IPython
           --exclude-module jupyter --exclude-module notebook
           launcher.py
+
+      - name: Verify bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $internal = "dist/DKPregistrator/_internal"
+          if (-not (Test-Path "$internal/torch")) { throw "CPU torch must be bundled" }
+          if (-not (Test-Path "$internal/webapp/frontend/dist/index.html")) { throw "frontend missing" }
+          if (-not (Test-Path "$internal/webapp/folder_dialog.ps1")) { throw "folder_dialog.ps1 missing" }
+          "{0:N0} MB" -f ((Get-ChildItem dist/DKPregistrator -Recurse | Measure-Object Length -Sum).Sum / 1MB)
 
       - name: Build with PyInstaller (macOS)
         if: runner.os == 'macOS'

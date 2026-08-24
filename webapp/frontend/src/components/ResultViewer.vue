@@ -226,6 +226,10 @@ onUnmounted(() => {
       <span class="badge" :class="r.used_mask ? 'ok' : 'plain'">
         {{ r.used_mask ? '마스크 정합' : '전체영역 정합' }}
       </span>
+      <span v-if="r.gate === 'affine'" class="badge warn"
+            title="전단·비등방 배율이 허용된 모델 — 비율이 왜곡될 수 있습니다 (relaxed 프로필)">
+        ⚠ affine (비율 왜곡 가능)
+      </span>
       <span class="metrics" v-if="r.status !== 'fail'">
         {{ r.label }} · {{ r.gate }} · inlier {{ r.n_inlier }}
         ({{ ((r.inlier_ratio ?? 0) * 100).toFixed(0) }}%) ·

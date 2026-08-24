@@ -6,13 +6,15 @@ tkinter GUI(main_gui.py)와 병행 제공. 실행: py -3.13 webapp/server.py
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # macOS: 미지원 MPS 연산 per-op CPU 폴백
+
 import asyncio
 import base64
-import dataclasses
 import io
 import json
 import logging
-import os
 import shutil
 import sys
 import threading
@@ -45,6 +47,17 @@ from register import (  # noqa: E402
 log = logging.getLogger(__name__)
 
 SAM2_MAX_SIDE = 1024
+
+
+def _torch_device() -> str:
+    """현재 엔진이 쓰는 가속 장치 — /api/state의 device 필드."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None \
+            and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def data_dir() -> str:
@@ -282,6 +295,7 @@ def state() -> dict:
         "fixed": SESSION.fixed_id(),
         "running": SESSION.running,
         "profiles": list(PROFILES),
+        "device": _torch_device(),
     }
 
 
@@ -433,8 +447,7 @@ def _run_registration(lazy: bool, profile: str, movings: list[str]) -> None:
             used_mask = fmask_real is not None and mmask_real is not None
             fmask = fmask_real if used_mask else _full_mask(fixed_id)
             mmask = mmask_real if used_mask else _full_mask(mid)
-            # 전체영역 정합은 similarity 전용 — 배경 매칭이 affine 비율왜곡을 만드는 사례 차단
-            pair_cfg = cfg if used_mask else dataclasses.replace(cfg, allow_affine=False)
+            pair_cfg = cfg  # affine 허용 여부는 프로필이 결정 (기본=similarity 전용)
             fmask_full = cv2.resize(fmask, (fixed_full.shape[1], fixed_full.shape[0]),
                                     interpolation=cv2.INTER_NEAREST)
             mmask_full = cv2.resize(mmask, (m_full.shape[1], m_full.shape[0]),
@@ -520,6 +533,58 @@ def _result_image(mid: str, kind: str) -> np.ndarray:
 
 # /{kind} 보다 반드시 먼저 등록 — FastAPI는 등록 순서로 매칭하므로 뒤에 두면
 # /download 요청이 kind="download"로 잡혀 400이 난다
+# ── GPU 가속 (선택 설치) ───────────────────────────
+
+_gpu_state = {"installing": False, "phase": "", "done": 0, "total": 0, "error": ""}
+
+
+@app.get("/api/gpu")
+def gpu_status() -> dict:
+    import gpu_setup
+    return {"device": _torch_device(), "gpu_name": gpu_setup.gpu_name(),
+            "installed": gpu_setup.installed(), "frozen": getattr(sys, "frozen", False),
+            **_gpu_state}
+
+
+def _gpu_install_worker() -> None:
+    import gpu_setup
+    try:
+        def on_status(d: dict) -> None:
+            _gpu_state.update(phase=d.get("phase", ""), done=d.get("done", 0),
+                              total=d.get("total", 0))
+            publish("gpu", dict(_gpu_state))
+        gpu_setup.install_cuda(on_status)
+        _gpu_state.update(phase="done", error="")
+    except BaseException as e:
+        log.exception("gpu install failed")
+        _gpu_state.update(phase="error", error=str(e))
+    finally:
+        _gpu_state["installing"] = False
+        publish("gpu", dict(_gpu_state))
+
+
+@app.post("/api/gpu/install")
+def gpu_install() -> dict:
+    """CUDA torch 선택 설치 시작 (백그라운드). 완료 후 앱 재시작 시 적용."""
+    import gpu_setup
+    if _gpu_state["installing"]:
+        raise HTTPException(409, "이미 설치 중입니다")
+    if not gpu_setup.gpu_name():
+        raise HTTPException(409, "NVIDIA GPU를 찾지 못했습니다")
+    _gpu_state.update(installing=True, phase="시작", done=0, total=0, error="")
+    threading.Thread(target=_gpu_install_worker, daemon=True).start()
+    return {"started": True}
+
+
+@app.post("/api/gpu/remove")
+def gpu_remove() -> dict:
+    import gpu_setup
+    if _gpu_state["installing"]:
+        raise HTTPException(409, "설치 중에는 제거할 수 없습니다")
+    gpu_setup.remove_cuda()
+    return {"removed": True}
+
+
 @app.post("/api/select_folder")
 def select_folder() -> dict:
     """저장 폴더 선택 — 로컬 네이티브 대화상자 (Windows: IFileOpenDialog, macOS: osascript)."""

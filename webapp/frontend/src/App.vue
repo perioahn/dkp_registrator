@@ -125,6 +125,33 @@ async function saveResults(only: string[] | null) {
   }
 }
 
+// GPU 가속 — 배포판 exe는 CPU torch 내장, GPU는 여기서 선택 설치
+interface GpuInfo {
+  device: string; gpu_name: string | null; installed: boolean; frozen: boolean
+  installing: boolean; phase: string; done: number; total: number; error: string
+}
+const gpu = ref<GpuInfo | null>(null)
+
+async function refreshGpu() {
+  try { gpu.value = await (await fetch('/api/gpu')).json() } catch { /* 무시 */ }
+}
+
+const gpuPct = computed(() => {
+  const g = gpu.value
+  return g?.total ? Math.floor((g.done / g.total) * 100) : 0
+})
+
+async function installGpu() {
+  if (!window.confirm(
+    'GPU 가속을 설치할까요?\n\n' +
+    '· 정합 속도 약 10배, 마스크 반응 약 4배 빨라집니다 (실측 RTX 4080)\n' +
+    '· 약 2.5GB 다운로드 (최초 1회) · 설치 후 앱을 다시 시작하면 적용됩니다\n' +
+    '· 설치 중에도 앱은 계속 사용할 수 있습니다')) return
+  const res = await fetch('/api/gpu/install', { method: 'POST' })
+  if (!res.ok) { msg.value = (await res.json()).detail ?? 'GPU 설치 실패'; return }
+  await refreshGpu()
+}
+
 function badge(r: ImgInfo['result']): { text: string; cls: string } | null {
   if (!r) return null
   if (r.status === 'pass') return { text: 'PASS', cls: 'ok' }
@@ -134,9 +161,15 @@ function badge(r: ImgInfo['result']): { text: string; cls: string } | null {
 
 onMounted(() => {
   refresh()
+  refreshGpu()
   // 서버 재시작 등으로 낡아진 브라우저 상태 방지 (Register 409 예방)
   window.addEventListener('focus', refresh)
   es = new EventSource('/api/events')
+  es.addEventListener('gpu', (e) => {
+    const d = JSON.parse((e as MessageEvent).data)
+    if (gpu.value) gpu.value = { ...gpu.value, ...d }
+    if (d.phase === 'done' || d.phase === 'error') refreshGpu()
+  })
   es.addEventListener('register', (e) => {
     const d = JSON.parse((e as MessageEvent).data)
     if (d.state === 'progress') msg.value = `정합 중 ${d.done + 1}/${d.total}: ${d.name}`
@@ -247,6 +280,26 @@ onUnmounted(() => es?.close())
         </div>
         <div v-if="!running && images.length" class="statusmsg">
           마스크 없이도 정합됩니다 — 기준·Moving 양쪽에 마스크가 있으면 마스크 정합
+        </div>
+        <div v-if="gpu" class="gpu-row">
+          <span v-if="gpu.device === 'cuda'" class="gpu-on">⚡ GPU 가속 사용 중</span>
+          <span v-else-if="gpu.device === 'mps'" class="gpu-on">⚡ Metal(MPS) 가속 사용 중</span>
+          <template v-else-if="gpu.installing">
+            <span class="gpu-progress">
+              GPU 가속 설치 중 {{ gpuPct }}%
+              <template v-if="gpu.total"> ({{ (gpu.done / 1e9).toFixed(1) }}/{{ (gpu.total / 1e9).toFixed(1) }}GB)</template>
+            </span>
+          </template>
+          <template v-else-if="gpu.installed">
+            <span class="gpu-on">✓ 설치됨 — 앱을 다시 시작하면 적용</span>
+          </template>
+          <template v-else-if="gpu.gpu_name && gpu.frozen">
+            <button class="gpu-btn" :title="`${gpu.gpu_name} 감지 — 약 2.5GB 다운로드`"
+                    @click="installGpu">⚡ GPU 가속 켜기</button>
+          </template>
+          <span v-else-if="gpu.gpu_name" class="gpu-hint">GPU 감지됨 (소스 실행: CUDA torch 설치 시 자동 사용)</span>
+          <span v-else class="gpu-hint">CPU 모드</span>
+          <span v-if="gpu.error" class="gpu-err">설치 실패: {{ gpu.error }}</span>
         </div>
         <div class="statusmsg">{{ msg }}</div>
       </div>

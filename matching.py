@@ -24,7 +24,13 @@ def _get_loftr_model(pretrained: str = 'indoor_new') -> KF.LoFTR:
             _loftr_model = KF.LoFTR(pretrained='indoor')
         _loftr_model.eval()
         if torch.cuda.is_available():
-            _loftr_model = _loftr_model.cuda()
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None \
+                and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+        _loftr_model = _loftr_model.to(device)
     return _loftr_model
 
 
@@ -54,9 +60,12 @@ def loftr_match(
         input2 = input2.to(device)
         with torch.no_grad():
             correspondences = model({"image0": input1, "image1": input2})
-    except torch.cuda.OutOfMemoryError:
-        print("[WARN] CUDA OOM - CPU fallback")
-        torch.cuda.empty_cache()
+    except RuntimeError:  # CUDA OOM(OutOfMemoryError ⊂ RuntimeError)·MPS 미지원 연산/OOM
+        if device.type == "cpu":
+            raise
+        print("[WARN] GPU 오류/OOM - CPU fallback")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         model_cpu = model.cpu()
         with torch.no_grad():
             correspondences = model_cpu({"image0": input1.cpu(), "image1": input2.cpu()})

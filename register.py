@@ -166,12 +166,24 @@ def _run_gate(k0, k1, conf, tooth_area, cfg: PipelineConfig = DEFAULT):
             k0, k1, M_sim, inliers_sim, tooth_area, cfg=cfg.sim_gate)
         if status in ('pass', 'warn'):
             return M_sim, inliers_sim, 'similarity', status, met, conf
-    # Affine fallback (allow_affine=False면 similarity만 — 비율 보존)
-    if not cfg.allow_affine:
-        return None, None, 'none', 'fail', {}, conf
+    # Affine RANSAC — 더 관대한 모델이라 inlier 집합을 넓게 잡는다
     M_aff, inliers_aff = cv2.estimateAffine2D(
         k1, k0, method=cv2.RANSAC,
         ransacReprojThreshold=cfg.ransac_thresh, confidence=0.99)
+
+    if not cfg.allow_affine:
+        # 비율 보존 구제: affine이 찾은 inlier로 similarity를 재적합해 다시 게이트.
+        # (affine 변환 자체는 쓰지 않으므로 전단·비등방 배율이 결과에 들어갈 수 없다)
+        if M_aff is not None and inliers_aff is not None and inliers_aff.sum() >= cfg.min_matches:
+            idx = inliers_aff.ravel().astype(bool)
+            M_res = _fit_similarity_lstsq(k1[idx], k0[idx])
+            if M_res is not None:
+                status, met = quality_gate_similarity(
+                    k0, k1, M_res, inliers_aff, tooth_area, cfg=cfg.sim_gate)
+                if status in ('pass', 'warn'):
+                    return M_res, inliers_aff, 'similarity', status, met, conf
+        return None, None, 'none', 'fail', {}, conf
+
     if M_aff is not None:
         status, met = quality_gate_affine(
             k0, k1, M_aff, inliers_aff, tooth_area, cfg=cfg.aff_gate)

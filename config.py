@@ -42,8 +42,10 @@ class PipelineConfig:
     ransac_thresh: float = 3.0
     min_matches: int = 4
     # False = similarity만 사용 (비등방 스케일·전단 금지 — 비율 보존).
-    # 전체영역(마스크리스) 정합은 배경 매칭이 섞여 affine이 비율을 깨는 사례가 있어 끔.
-    allow_affine: bool = True
+    # 같은 악궁을 두 번 찍은 사진의 실제 관계는 similarity(회전+등방배율+평행이동)다.
+    # affine은 전단·비등방 배율을 허용해 매칭이 나쁠 때 "억지로 맞춘" 왜곡 결과를 낸다
+    # (실사고 2회). 기본은 끄고, relaxed 프로필에서만 최후 수단으로 허용.
+    allow_affine: bool = False
     # Lazy 모드: 저해상 프리스크리닝으로 8조합 실행 순서 결정 (pass 시 조기종료)
     lazy_prescreen_side: int = 320
     sim_gate: SimilarityGate = SimilarityGate()
@@ -65,6 +67,7 @@ PROFILES: dict[str, PipelineConfig] = {
                             coverage_warn=0.25),
     ),
     "relaxed": PipelineConfig(
+        allow_affine=True,  # 최후 수단 — 비율 왜곡 가능성을 감수하고라도 결과를 얻는 프로필
         sim_gate=SimilarityGate(
             min_inlier_fail=8, min_inlier_warn=20,
             reproj_median_fail=7.0, reproj_p90_fail=16.0,

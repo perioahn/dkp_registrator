@@ -81,6 +81,14 @@ body {
 .register-btn.sel { background: var(--panel2); color: var(--text);
   border: 1px solid var(--accent); }
 .register-btn.sel:disabled { border-color: var(--border); }
+.gpu-row { font-size: 11.5px; display: flex; flex-direction: column; gap: 4px; }
+.gpu-on { color: #8ae6a8; }
+.gpu-hint, .gpu-progress { color: var(--muted); }
+.gpu-err { color: #ffb4ab; }
+.gpu-btn {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--accent);
+  border-radius: 7px; padding: 6px 10px; cursor: pointer; font-size: 12px;
+}
 .save-row { display: flex; gap: 6px; }
 .save-btn {
   flex: 1; padding: 7px 4px; font-size: 12px; cursor: pointer;
