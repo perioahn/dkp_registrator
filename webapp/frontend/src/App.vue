@@ -6,11 +6,12 @@ import ResultViewer from './components/ResultViewer.vue'
 interface ImgInfo {
   id: string; role: 'fixed' | 'moving'; name: string
   w: number; h: number; n_objects: number; has_current: boolean
-  mask_ready: boolean
+  mask_ready: boolean; mask_rev: number
   result: null | {
     status: string; gate: string; label: string; reason?: string
     n_inlier?: number; inlier_ratio?: number; reproj_median?: number
     rotation_deg?: number; scale?: number; manual_adjusted?: boolean
+    used_mask?: boolean
   }
 }
 
@@ -26,9 +27,18 @@ let es: EventSource | null = null
 
 const selected = computed(() => images.value.find((i) => i.id === selectedId.value) ?? null)
 const fixedImg = computed(() => images.value.find((i) => i.role === 'fixed') ?? null)
-const canRegister = computed(() =>
-  !running.value && fixedImg.value?.mask_ready &&
-  images.value.some((i) => i.role === 'moving' && i.mask_ready))
+// 마스크는 선택 사항 — 기준 + Moving만 있으면 실행 가능 (페어 양쪽 마스크 시에만 마스크 정합)
+const canRegisterAll = computed(() =>
+  !running.value && !!fixedImg.value && images.value.some((i) => i.role === 'moving'))
+// 선택 정합: 체크된 Moving만 (기본 전부 해제)
+const checked = ref<Set<string>>(new Set())
+function toggleCheck(id: string) {
+  const s = new Set(checked.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  checked.value = s
+}
+const canRegisterSel = computed(() => canRegisterAll.value && checked.value.size > 0)
 
 async function refresh() {
   const d = await (await fetch('/api/state')).json()
@@ -61,23 +71,58 @@ async function removeImage(id: string) {
   await refresh()
 }
 
-async function startRegister() {
+async function clearAll() {
+  if (!images.value.length) return
+  if (!window.confirm('기준·Moving 이미지를 모두 비울까요? (마스크·정합 결과 포함)')) return
+  await fetch('/api/reset', { method: 'POST' })
+  selectedId.value = null
+  checked.value = new Set()
+  viewMode.value = 'mask'
+  msg.value = '비웠습니다'
+  await refresh()
+}
+
+async function startRegister(only: string[] | null = null) {
   msg.value = ''
   const res = await fetch('/api/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ lazy: lazy.value, profile: profile.value }),
+    body: JSON.stringify({ lazy: lazy.value, profile: profile.value, only }),
   })
   const d = await res.json()
   if (!res.ok) { msg.value = d.detail ?? '실행 실패'; return }
   running.value = true
-  if (d.skipped_no_mask?.length) {
-    msg.value = `마스크 없는 ${d.skipped_no_mask.length}장 제외`
-  }
 }
 
-function select(id: string, mode: 'mask' | 'result' = 'mask') {
+function select(id: string, mode?: 'mask' | 'result') {
   selectedId.value = id
-  viewMode.value = mode
+  // 탭 유지: 지정 없으면 보던 탭 그대로 (결과 없는 이미지면 마스크로)
+  const want = mode ?? viewMode.value
+  const img = images.value.find((i) => i.id === id)
+  viewMode.value = want === 'result' && !img?.result ? 'mask' : want
+  refresh() // 마스크 상태·미니맵 조건이 낡지 않게 전환 시 재조회
+}
+
+// 일괄 저장: 폴더 선택 → 결과 이미지 몰아서 저장 (전체/선택)
+const anyResult = computed(() => images.value.some((i) => i.role === 'moving' && i.result))
+const checkedWithResult = computed(() =>
+  [...checked.value].filter((id) => images.value.find((i) => i.id === id)?.result))
+
+async function saveResults(only: string[] | null) {
+  msg.value = '저장 폴더 선택 창을 확인하세요…'
+  try {
+    const sel = await (await fetch('/api/select_folder', { method: 'POST' })).json()
+    if (!sel.path) { msg.value = ''; return }
+    const res = await fetch('/api/save_results', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dir: sel.path, only }),
+    })
+    const d = await res.json()
+    if (!res.ok) throw new Error(d.detail ?? `HTTP ${res.status}`)
+    msg.value = `${d.saved}장 저장됨 → ${d.dir}` +
+      (d.failed.length ? ` (실패 ${d.failed.length})` : '')
+  } catch (e: any) {
+    msg.value = `저장 실패: ${e.message ?? e}`
+  }
 }
 
 function badge(r: ImgInfo['result']): { text: string; cls: string } | null {
@@ -100,7 +145,11 @@ onMounted(() => {
     else if (d.state === 'done') {
       msg.value = `정합 완료 (${d.total}장)`
       running.value = false
-      refresh()
+      refresh().then(() => {
+        // 성공한 항목은 체크 해제, 실패한 항목은 유지 (재시도 편의)
+        checked.value = new Set([...checked.value].filter((id) =>
+          images.value.find((i) => i.id === id)?.result?.status === 'fail'))
+      })
       const firstMoving = images.value.find((i) => i.role === 'moving' && i.result)
       if (firstMoving) select(firstMoving.id, 'result')
     } else if (d.state === 'error') {
@@ -126,6 +175,8 @@ onUnmounted(() => es?.close())
           + Moving 추가
           <input type="file" accept="image/*" multiple hidden @change="uploadFiles('moving', $event)" />
         </label>
+        <button class="clear-btn" :disabled="!images.length" title="기준·Moving 모두 비우기"
+                @click="clearAll">🗑</button>
       </div>
 
       <div class="img-list">
@@ -134,8 +185,16 @@ onUnmounted(() => es?.close())
           :key="img.id"
           class="img-item"
           :class="{ active: img.id === selectedId, fixed: img.role === 'fixed' }"
-          @click="select(img.id, img.result ? 'result' : 'mask')"
+          @click="select(img.id)"
         >
+          <input
+            v-if="img.role === 'moving'"
+            type="checkbox"
+            class="sel-chk"
+            :checked="checked.has(img.id)"
+            title="선택 정합 대상"
+            @click.stop="toggleCheck(img.id)"
+          />
           <img :src="`/api/image/${img.id}`" />
           <div class="img-meta">
             <div class="img-name">
@@ -143,7 +202,7 @@ onUnmounted(() => es?.close())
             </div>
             <div class="img-sub">
               <span :class="{ 'mask-ok': img.mask_ready }">
-                {{ img.mask_ready ? '마스크 ✓' : '마스크 필요' }}
+                {{ img.mask_ready ? '마스크 ✓' : '마스크 없음' }}
               </span>
               <span v-if="badge(img.result)" class="badge" :class="badge(img.result)!.cls">
                 {{ badge(img.result)!.text }}
@@ -165,12 +224,29 @@ onUnmounted(() => es?.close())
             <option v-for="p in profiles" :key="p" :value="p">{{ p }}</option>
           </select>
         </label>
-        <button class="register-btn" :disabled="!canRegister" @click="startRegister"
-                :title="canRegister ? '' : '기준과 Moving 각각 마스크를 지정해야 실행됩니다'">
-          {{ running ? '정합 중…' : '▶ Register' }}
+        <button class="register-btn" :disabled="!canRegisterAll" @click="startRegister(null)"
+                title="모든 Moving을 기준에 정합 (마스크는 있는 페어만 사용)">
+          {{ running ? '정합 중…'
+             : images.some((i) => i.result) ? '▶ 전체 다시 정합' : '▶ 전체 정합' }}
         </button>
-        <div v-if="!canRegister && !running && images.length" class="statusmsg">
-          기준 + Moving에 마스크를 지정하면 활성화됩니다
+        <button class="register-btn sel" :disabled="!canRegisterSel"
+                :title="checked.size ? '' : 'Moving 행의 체크박스를 선택하면 활성화됩니다'"
+                @click="startRegister([...checked])">
+          ▶ 선택 정합{{ checked.size ? ` (${checked.size})` : '' }}
+        </button>
+        <div class="save-row">
+          <button class="save-btn" :disabled="running || !anyResult"
+                  title="모든 정합 결과를 지정 폴더에 저장" @click="saveResults(null)">
+            💾 전체 저장
+          </button>
+          <button class="save-btn" :disabled="running || !checkedWithResult.length"
+                  title="체크된 이미지의 정합 결과만 저장"
+                  @click="saveResults(checkedWithResult)">
+            💾 선택 저장{{ checkedWithResult.length ? ` (${checkedWithResult.length})` : '' }}
+          </button>
+        </div>
+        <div v-if="!running && images.length" class="statusmsg">
+          마스크 없이도 정합됩니다 — 기준·Moving 양쪽에 마스크가 있으면 마스크 정합
         </div>
         <div class="statusmsg">{{ msg }}</div>
       </div>
@@ -183,7 +259,8 @@ onUnmounted(() => es?.close())
           <button :class="{ on: viewMode === 'result' }" :disabled="!selected.result"
                   @click="viewMode = 'result'">결과</button>
         </div>
-        <MaskEditor v-if="viewMode === 'mask'" :key="selected.id" :img="selected" @changed="refresh" />
+        <MaskEditor v-if="viewMode === 'mask'" :key="selected.id" :img="selected" :fixed="fixedImg"
+                    @changed="refresh" @goto-fixed="fixedImg && select(fixedImg.id, 'mask')" />
         <ResultViewer v-else-if="selected.result" :key="'r' + selected.id" :img="selected" @changed="refresh" />
       </template>
       <p v-else class="hint center">← 이미지를 업로드하세요</p>

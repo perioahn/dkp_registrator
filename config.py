@@ -41,6 +41,9 @@ class PipelineConfig:
     mask_sigma: int = 5
     ransac_thresh: float = 3.0
     min_matches: int = 4
+    # False = similarity만 사용 (비등방 스케일·전단 금지 — 비율 보존).
+    # 전체영역(마스크리스) 정합은 배경 매칭이 섞여 affine이 비율을 깨는 사례가 있어 끔.
+    allow_affine: bool = True
     # Lazy 모드: 저해상 프리스크리닝으로 8조합 실행 순서 결정 (pass 시 조기종료)
     lazy_prescreen_side: int = 320
     sim_gate: SimilarityGate = SimilarityGate()

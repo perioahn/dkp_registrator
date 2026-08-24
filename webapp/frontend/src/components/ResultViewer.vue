@@ -9,6 +9,7 @@ const props = defineProps<{
       status: string; gate: string; label: string; reason?: string
       n_inlier?: number; inlier_ratio?: number; reproj_median?: number
       rotation_deg?: number; scale?: number; manual_adjusted?: boolean
+      used_mask?: boolean
     }
   }
 }>()
@@ -38,6 +39,11 @@ const ver = ref(0) // 미세조정 적용 후 이미지 강제 리로드
 const fixedUrl = computed(() => `/api/result/${props.img.id}/fixed`)
 const regUrl = computed(() => `/api/result/${props.img.id}/registered?v=${ver.value}`)
 const fcUrl = computed(() => `/api/result/${props.img.id}/false_color?v=${ver.value}`)
+// src가 바뀌면 디코드 완료까지 숨김 — 부분 렌더 순간 노출 방지
+const regLoaded = ref(false)
+const fcLoaded = ref(false)
+watch([regUrl], () => { regLoaded.value = false })
+watch([fcUrl], () => { fcLoaded.value = false })
 const matchUrl = computed(() => `/api/result/${props.img.id}/match_viz`)
 
 const transform = computed(() =>
@@ -217,6 +223,9 @@ onUnmounted(() => {
     <div class="toolbar">
       <span class="badge big" :class="badgeCls">{{ r.status.toUpperCase() }}</span>
       <span v-if="r.manual_adjusted" class="badge warn">수동조정</span>
+      <span class="badge" :class="r.used_mask ? 'ok' : 'plain'">
+        {{ r.used_mask ? '마스크 정합' : '전체영역 정합' }}
+      </span>
       <span class="metrics" v-if="r.status !== 'fail'">
         {{ r.label }} · {{ r.gate }} · inlier {{ r.n_inlier }}
         ({{ ((r.inlier_ratio ?? 0) * 100).toFixed(0) }}%) ·
@@ -227,7 +236,6 @@ onUnmounted(() => {
       </span>
       <span v-else class="metrics fail-reason">{{ failText }}</span>
       <span class="spacer" />
-      <a v-if="r.status !== 'fail'" class="dl-btn" :href="`/api/result/${img.id}/download`">💾 저장</a>
     </div>
 
     <template v-if="r.status !== 'fail'">
@@ -271,17 +279,25 @@ onUnmounted(() => {
         </div>
         <div v-else ref="stackedEl" class="stacked">
           <img ref="baseImgEl" :src="fixedUrl" :style="{ transform }" @load="updateLine" />
+          <!-- 디코드 완료 전 표시 금지 (visibility) — 부분 렌더/옛 프레임이 순간 왜곡처럼 보이는 것 방지 -->
           <img
             v-if="mode === 'wipe'"
             :src="regUrl"
-            :style="{ transform, clipPath: `inset(0 ${100 - wipe}% 0 0)` }"
+            :style="{ transform, clipPath: `inset(0 ${100 - wipe}% 0 0)`,
+                      visibility: regLoaded ? 'visible' : 'hidden' }"
+            @load="regLoaded = true"
           />
           <img v-else-if="mode === 'false'" :src="fcUrl"
-               :style="{ transform, opacity: fcOpacity / 100 }" />
+               :style="{ transform, opacity: fcOpacity / 100,
+                         visibility: fcLoaded ? 'visible' : 'hidden' }"
+               @load="fcLoaded = true" />
           <img v-else-if="mode === 'flicker'" :src="regUrl"
-               :style="{ transform, opacity: flickOn ? 1 : 0 }" />
+               :style="{ transform, opacity: flickOn && regLoaded ? 1 : 0 }"
+               @load="regLoaded = true" />
           <img v-else-if="mode === 'adjust'" :src="regUrl"
-               :style="{ transform: ghostTransform, opacity: 0.5 }" />
+               :style="{ transform: ghostTransform,
+                         opacity: regLoaded ? 0.5 : 0 }"
+               @load="regLoaded = true" />
           <div v-if="mode === 'wipe'" class="wipe-line"
                :style="{ left: lineBox.left + 'px', top: lineBox.top + 'px',
                          height: lineBox.height + 'px' }">

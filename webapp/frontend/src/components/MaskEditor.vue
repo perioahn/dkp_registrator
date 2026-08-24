@@ -1,8 +1,17 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-const props = defineProps<{ img: { id: string; name: string; w: number; h: number; n_objects: number } }>()
-const emit = defineEmits<{ changed: [] }>()
+const props = defineProps<{
+  img: { id: string; name: string; w: number; h: number; n_objects: number }
+  fixed?: { id: string; name: string; mask_ready: boolean; mask_rev: number } | null
+}>()
+const emit = defineEmits<{ changed: []; gotoFixed: [] }>()
+
+// 고정상 마스크 미니맵: 이동상 작업 중 + 고정상에 마스크가 있을 때만
+const showMinimap = computed(() =>
+  !!props.fixed && props.fixed.id !== props.img.id && props.fixed.mask_ready)
+const miniOpen = ref(true)
+const miniBig = ref(false)
 
 const overlayTs = ref(0)
 const busy = ref(false)
@@ -75,6 +84,18 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       >
         <img class="base" :src="`/api/image/${img.id}`" draggable="false" />
         <img class="overlay" :src="`/api/mask/${img.id}/overlay?t=${overlayTs}`" draggable="false" />
+      </div>
+      <!-- 고정상 마스크 미니맵 — 이동상 마스킹 시 기준 마스크 위치 참고용 -->
+      <div v-if="showMinimap" class="fixed-minimap" :class="{ big: miniBig, closed: !miniOpen }">
+        <div class="fm-head">
+          <span>기준 마스크</span>
+          <button class="fm-btn" @click="emit('gotoFixed')" title="기준 이미지 마스크 수정으로 이동">수정</button>
+          <button class="fm-btn" @click="miniOpen = !miniOpen">{{ miniOpen ? '▾' : '▸' }}</button>
+        </div>
+        <div v-if="miniOpen" class="fm-stack" title="클릭 = 확대/축소" @click="miniBig = !miniBig">
+          <img :src="`/api/image/${fixed!.id}`" draggable="false" />
+          <img class="fm-overlay" :src="`/api/mask/${fixed!.id}/overlay?t=${fixed!.mask_rev}`" draggable="false" />
+        </div>
       </div>
     </div>
   </div>

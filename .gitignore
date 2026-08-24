@@ -24,3 +24,4 @@ dist/
 webapp/frontend/node_modules/
 !webapp/frontend/dist/
 !webapp/frontend/dist/**
+.gstack/

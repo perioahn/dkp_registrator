@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import io
 import json
 import logging
@@ -197,7 +198,7 @@ def _sam_select(img_id: str) -> None:
 
 def _mask_state(img_id: str) -> dict:
     return SESSION.masks.setdefault(
-        img_id, {"points": [], "confirmed": [], "current": None})
+        img_id, {"points": [], "confirmed": [], "current": None, "rev": 0})
 
 
 def _predict_mask(img_id: str) -> None:
@@ -273,6 +274,7 @@ def state() -> dict:
             "n_objects": len(st.get("confirmed", [])),
             "has_current": st.get("current") is not None,
             "mask_ready": _union_mask(i) is not None,
+            "mask_rev": st.get("rev", 0),  # 미니맵 오버레이 캐시버스터
             "result": _result_summary(SESSION.results.get(i)),
         }
     return {
@@ -294,6 +296,7 @@ def _result_summary(r: dict | None) -> dict | None:
         "reproj_median": m.get("reproj_median"),
         "rotation_deg": m.get("rotation_deg"), "scale": m.get("scale"),
         "manual_adjusted": bool(r.get("manual_adjusted")),
+        "used_mask": bool(r.get("used_mask")),
     }
 
 
@@ -375,6 +378,7 @@ async def mask_click(img_id: str, x: float = Body(embed=True),
         raise HTTPException(404)
     st = _mask_state(img_id)
     st["points"].append({"x": x, "y": y, "label": label})
+    st["rev"] = st.get("rev", 0) + 1
     await asyncio.to_thread(_predict_mask, img_id)
     return {"points": st["points"], "ts": time.time_ns()}
 
@@ -400,28 +404,39 @@ async def mask_action(img_id: str, action: str = Body(embed=True)) -> dict:
         st["current"] = None
     else:
         raise HTTPException(400, "unknown action")
+    st["rev"] = st.get("rev", 0) + 1
     return {"n_objects": len(st["confirmed"]), "points": st["points"],
             "ts": time.time_ns()}
 
 
 # ── 정합 실행 ──────────────────────────────────────
 
-def _run_registration(lazy: bool, profile: str) -> None:
+def _full_mask(img_id: str) -> np.ndarray:
+    """마스크 미지정 시 전체영역 정합용 전면 마스크 (엔진 무수정 경로)."""
+    h, w = get_work(img_id).shape[:2]
+    return np.full((h, w), 255, dtype=np.uint8)
+
+
+def _run_registration(lazy: bool, profile: str, movings: list[str]) -> None:
     cfg = get_profile(profile)
     fixed_id = SESSION.fixed_id()
-    movings = SESSION.moving_ids()
     try:
-        f_scale = work_scale(fixed_id)
         fixed_full = get_full(fixed_id)
-        fmask = _union_mask(fixed_id)
-        fmask_full = cv2.resize(fmask, (fixed_full.shape[1], fixed_full.shape[0]),
-                                interpolation=cv2.INTER_NEAREST)
+        fmask_real = _union_mask(fixed_id)
         total = len(movings)
         for i, mid in enumerate(movings):
             publish("register", {"state": "progress", "done": i, "total": total,
                                  "name": SESSION.images[mid]["name"]})
             m_full = get_full(mid)
-            mmask = _union_mask(mid)
+            mmask_real = _union_mask(mid)
+            # 페어 정책: 양쪽 다 마스크가 있을 때만 마스크 정합, 아니면 전체영역
+            used_mask = fmask_real is not None and mmask_real is not None
+            fmask = fmask_real if used_mask else _full_mask(fixed_id)
+            mmask = mmask_real if used_mask else _full_mask(mid)
+            # 전체영역 정합은 similarity 전용 — 배경 매칭이 affine 비율왜곡을 만드는 사례 차단
+            pair_cfg = cfg if used_mask else dataclasses.replace(cfg, allow_affine=False)
+            fmask_full = cv2.resize(fmask, (fixed_full.shape[1], fixed_full.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
             mmask_full = cv2.resize(mmask, (m_full.shape[1], m_full.shape[0]),
                                     interpolation=cv2.INTER_NEAREST)
 
@@ -431,13 +446,22 @@ def _run_registration(lazy: bool, profile: str) -> None:
                                      "lazy_label": label})
 
             fn = register_test_lazy if lazy else register_test
-            kw = {"cfg": cfg}
+            kw = {"cfg": pair_cfg}
             if lazy:
                 kw["progress_callback"] = cb
             entry = fn(fixed_full, m_full, fmask_full, mmask_full, **kw)[0]
-            SESSION.results[mid] = entry
-            publish("register", {"state": "one_done", "id": mid,
-                                 "summary": _result_summary(entry)})
+            entry["used_mask"] = used_mask
+            prev = SESSION.results.get(mid)
+            if entry.get("status") == "fail" and prev and prev.get("status") != "fail":
+                # 재정합 실패 — 기존 정상 결과 보존 (Codex 확정)
+                publish("register", {"state": "one_done", "id": mid,
+                                     "summary": _result_summary(prev),
+                                     "kept": True,
+                                     "note": f"재정합 실패({entry.get('reason')}) — 기존 결과 유지"})
+            else:
+                SESSION.results[mid] = entry
+                publish("register", {"state": "one_done", "id": mid,
+                                     "summary": _result_summary(entry)})
         publish("register", {"state": "done", "total": total})
     except Exception as e:
         log.exception("registration failed")
@@ -448,21 +472,31 @@ def _run_registration(lazy: bool, profile: str) -> None:
 
 @app.post("/api/register")
 def run_register(lazy: bool = Body(default=False, embed=True),
-                 profile: str = Body(default="normal", embed=True)) -> dict:
+                 profile: str = Body(default="normal", embed=True),
+                 only: list[str] | None = Body(default=None, embed=True)) -> dict:
+    """전체 정합(only=None: 모든 Moving) / 선택 정합(only=[id,...]).
+
+    마스크는 선택 사항 — 페어(기준+해당 Moving) 양쪽에 있을 때만 마스크 정합,
+    아니면 전체영역 정합으로 진행.
+    """
     if SESSION.running:
         raise HTTPException(409, "이미 실행 중")
     fixed_id = SESSION.fixed_id()
-    if not fixed_id or _union_mask(fixed_id) is None:
-        raise HTTPException(409, "Fixed 이미지와 마스크가 필요합니다")
-    movings = [m for m in SESSION.moving_ids() if _union_mask(m) is not None]
-    if not movings:
-        raise HTTPException(409, "마스크가 지정된 Moving 이미지가 없습니다")
-    missing = [SESSION.images[m]["name"] for m in SESSION.moving_ids()
-               if _union_mask(m) is None]
+    if not fixed_id:
+        raise HTTPException(409, "Fixed 이미지가 필요합니다")
+    all_movings = SESSION.moving_ids()
+    if only is not None:
+        movings = [m for m in all_movings if m in set(only)]
+        if not movings:
+            raise HTTPException(422, "선택된 Moving 이미지가 없습니다")
+    else:
+        movings = all_movings
+        if not movings:
+            raise HTTPException(409, "Moving 이미지가 없습니다")
     SESSION.running = True
-    threading.Thread(target=_run_registration, args=(lazy, profile),
+    threading.Thread(target=_run_registration, args=(lazy, profile, movings),
                      daemon=True).start()
-    return {"started": True, "count": len(movings), "skipped_no_mask": missing}
+    return {"started": True, "count": len(movings)}
 
 
 def _result_image(mid: str, kind: str) -> np.ndarray:
@@ -482,6 +516,81 @@ def _result_image(mid: str, kind: str) -> np.ndarray:
     if img is None:
         raise HTTPException(404, r.get("reason") or "이미지 없음")
     return img
+
+
+# /{kind} 보다 반드시 먼저 등록 — FastAPI는 등록 순서로 매칭하므로 뒤에 두면
+# /download 요청이 kind="download"로 잡혀 400이 난다
+@app.post("/api/select_folder")
+def select_folder() -> dict:
+    """저장 폴더 선택 — 로컬 네이티브 대화상자 (Windows: IFileOpenDialog, macOS: osascript)."""
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(["osascript", "-e",
+                                'POSIX path of (choose folder with prompt "저장 폴더 선택")'],
+                               capture_output=True, timeout=300)
+            path = r.stdout.decode("utf-8", "replace").strip().rstrip("/")
+        else:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "folder_dialog.ps1")
+            r = subprocess.run(["powershell", "-STA", "-NoProfile", "-ExecutionPolicy",
+                                "Bypass", "-File", script],
+                               capture_output=True, timeout=300)
+            path = r.stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        raise HTTPException(500, "폴더 선택 다이얼로그 실패")
+    path = path.splitlines()[-1].strip() if path else ""
+    return {"path": path if os.path.isdir(path) else None}
+
+
+def _encode_result_jpg(mid: str) -> tuple[str, bytes]:
+    """(파일명, JPEG 바이트) — 개별 다운로드와 동일 규칙."""
+    img = _result_image(mid, "registered")
+    fixed_name = os.path.splitext(SESSION.images[SESSION.fixed_id()]["name"])[0]
+    mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
+                           [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        raise HTTPException(500, "JPEG 인코딩 실패")
+    return f"{fixed_name}_R_{mov_name}.jpg", buf.tobytes()
+
+
+@app.post("/api/save_results")
+def save_results(dir: str = Body(embed=True),
+                 only: list[str] | None = Body(default=None, embed=True)) -> dict:
+    """정합 결과 일괄 저장 — 전체(only=None) 또는 선택(only=[id,...])."""
+    if not os.path.isdir(dir):
+        raise HTTPException(400, f"폴더가 없습니다: {dir}")
+    targets = [m for m in SESSION.moving_ids()
+               if (only is None or m in set(only)) and SESSION.results.get(m)]
+    if not targets:
+        raise HTTPException(409, "저장할 정합 결과가 없습니다")
+    saved, failed = [], []
+    for mid in targets:
+        try:
+            name, data = _encode_result_jpg(mid)
+            with open(os.path.join(dir, name), "wb") as f:
+                f.write(data)
+            saved.append(name)
+        except Exception:
+            log.exception("save failed: %s", mid)
+            failed.append(SESSION.images[mid]["name"])
+    return {"saved": len(saved), "failed": failed, "dir": dir}
+
+
+@app.get("/api/result/{mid}/download")
+def result_download(mid: str):
+    img = _result_image(mid, "registered")
+    fixed_name = os.path.splitext(
+        SESSION.images[SESSION.fixed_id()]["name"])[0]
+    mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
+    out = os.path.join(SESSION.dir, f"{fixed_name}_R_{mov_name}.jpg")
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
+                           [cv2.IMWRITE_JPEG_QUALITY, 95])
+    with open(out, "wb") as f:
+        f.write(buf.tobytes())
+    return FileResponse(out, filename=os.path.basename(out),
+                        media_type="image/jpeg")
 
 
 @app.get("/api/result/{mid}/{kind}")
@@ -538,21 +647,6 @@ def adjust_result(mid: str,
     r["manual_adjusted"] = not np.allclose(new_M, r["M_orig"])
     return {"ok": True, "manual_adjusted": r["manual_adjusted"],
             "ts": time.time_ns()}
-
-
-@app.get("/api/result/{mid}/download")
-def result_download(mid: str):
-    img = _result_image(mid, "registered")
-    fixed_name = os.path.splitext(
-        SESSION.images[SESSION.fixed_id()]["name"])[0]
-    mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
-    out = os.path.join(SESSION.dir, f"{fixed_name}_R_{mov_name}.jpg")
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                           [cv2.IMWRITE_JPEG_QUALITY, 95])
-    with open(out, "wb") as f:
-        f.write(buf.tobytes())
-    return FileResponse(out, filename=os.path.basename(out),
-                        media_type="image/jpeg")
 
 
 @app.get("/api/events")

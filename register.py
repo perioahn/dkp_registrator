@@ -166,7 +166,9 @@ def _run_gate(k0, k1, conf, tooth_area, cfg: PipelineConfig = DEFAULT):
             k0, k1, M_sim, inliers_sim, tooth_area, cfg=cfg.sim_gate)
         if status in ('pass', 'warn'):
             return M_sim, inliers_sim, 'similarity', status, met, conf
-    # Affine fallback
+    # Affine fallback (allow_affine=False면 similarity만 — 비율 보존)
+    if not cfg.allow_affine:
+        return None, None, 'none', 'fail', {}, conf
     M_aff, inliers_aff = cv2.estimateAffine2D(
         k1, k0, method=cv2.RANSAC,
         ransacReprojThreshold=cfg.ransac_thresh, confidence=0.99)
