@@ -39,7 +39,7 @@ jobs:
           python -m pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
           python -m pip install sam2 huggingface_hub fastapi uvicorn python-multipart pyinstaller pytest httpx
       - name: Verify API and geometry contracts
-        run: python -m pytest tests/test_workspace_api.py tests/test_similarity_only.py -q
+        run: python -m pytest tests/test_runtime.py tests/test_workspace_api.py tests/test_similarity_only.py -q
       - name: Build native application
         run: python scripts/build_desktop.py
       - name: Start actual executable and verify workspace

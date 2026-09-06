@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import hashlib
+import base64
 import socket
 from collections import OrderedDict
 
@@ -551,8 +552,70 @@ async def mask_click(img_id: str, x: float = Body(embed=True), y: float = Body(e
     return await asyncio.to_thread(_mutate_mask, img_id, "click", (x, y, label))
 
 
+_mask_previews = OrderedDict()
+
+
+def _preview_mask(img_id, points):
+    with SESSION.lock:
+        _require_idle()
+        _require_image(img_id)
+        h, w = get_work(img_id).shape[:2]
+        if not points or len(points) > 100:
+            raise HTTPException(422, "미리보기 점은 1~100개를 사용할 수 있습니다")
+        for p in points:
+            try:
+                valid = np.isfinite([p['x'], p['y']]).all() and 0 <= p['x'] < w and 0 <= p['y'] < h and p['label'] in (0, 1)
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise HTTPException(422, "마스크 점이 사진 범위 밖입니다")
+        original = SESSION.masks.get(img_id)
+        temporary = snapshot(original) if original else {"confirmed": [], "rev": 0}
+        temporary.update(points=points, current=None)
+        SESSION.masks[img_id] = temporary
+        try:
+            _predict_mask(img_id)
+            token = uuid.uuid4().hex
+            frozen = _freeze_mask(img_id, temporary['current'])
+            overlay = base64.b64encode(_mask_overlay_png(img_id)).decode('ascii')
+            _mask_previews[token] = (SESSION, img_id, SESSION.revision, frozen)
+            while len(_mask_previews) > 8:
+                _mask_previews.popitem(last=False)
+            return {"token": token, "overlay": "data:image/png;base64," + overlay}
+        except Exception as exc:
+            log.exception("SAM preview failed")
+            raise HTTPException(503, f"마스크 미리보기 실패: {type(exc).__name__}: {exc}. 최초 실행 시 모델 다운로드에 인터넷이 필요합니다. 대응점 A는 마스크 없이 사용할 수 있습니다.") from exc
+        finally:
+            if original is None:
+                SESSION.masks.pop(img_id, None)
+            else:
+                SESSION.masks[img_id] = original
+
+
+@app.post("/api/mask/{img_id}/preview")
+async def mask_preview(img_id: str, points: list = Body(embed=True)):
+    return await asyncio.to_thread(_preview_mask, img_id, points)
+
+
+def _commit_mask_preview(img_id, token):
+    with SESSION.lock:
+        _require_idle()
+        draft = _mask_previews.pop(token, None)
+        if not draft or draft[0] is not SESSION or draft[1] != img_id or draft[2] != SESSION.revision:
+            raise HTTPException(409, "사진이나 작업 상태가 바뀌었습니다. 다시 클릭한 뒤 Z로 확정하세요.")
+        before = SESSION.snapshot()
+        st = _mask_state(img_id)
+        st['confirmed'].append(draft[3])
+        st['points'], st['current'] = [], None
+        st['rev'] += 1
+        _record("마스크 확정", img_id, before)
+        return {"points": [], "n_objects": len(st['confirmed'])}
+
+
 @app.post("/api/mask/{img_id}/action")
-async def mask_action(img_id: str, action: str = Body(embed=True)):
+async def mask_action(img_id: str, action: str = Body(embed=True), draft_token: str | None = Body(None)):
+    if action == "confirm" and draft_token:
+        return await asyncio.to_thread(_commit_mask_preview, img_id, draft_token)
     if action == "undo":
         return history_action("undo")
     return await asyncio.to_thread(_mutate_mask, img_id, action)

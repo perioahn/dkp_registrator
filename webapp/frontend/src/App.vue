@@ -15,6 +15,7 @@ import {
 } from "./workspace";
 
 const photos = ref<Photo[]>([]),
+  appVersion = ref(""),
   fixedId = ref<string | null>(null),
   activeId = ref<string | null>(null),
   checked = ref(new Set<string>()),
@@ -121,8 +122,7 @@ const reviewable = computed(
 );
 const toolNames: { key: Tool; name: string }[] = [
   { key: "compare", name: "비교" },
-  { key: "mask", name: "마스크" },
-  { key: "anchor", name: "대응점" },
+  { key: "mask", name: "점·마스크" },
   { key: "adjust", name: "미세조정" },
 ];
 const modeNames: { key: ComparisonMode; name: string }[] = [
@@ -147,6 +147,7 @@ async function refresh() {
     appliedSequence = seq;
     const oldFixed = fixedId.value;
     photos.value = d.images;
+    appVersion.value = d.version ?? "구버전 서버";
     revision.value = d.revision ?? 0;
     running.value = d.running;
     fixedId.value =
@@ -272,6 +273,7 @@ let historyQueue: Promise<void> = Promise.resolve();
 function undo(redo = false) {
   if (running.value || tool.value === "edit") return;
   if (tool.value === "adjust" && workspace.value?.draftUndo(redo)) return;
+  if (!redo && workspace.value?.cancelInput()) return;
   historyQueue = historyQueue.then(() => performUndo(redo));
   return historyQueue;
 }
@@ -529,7 +531,7 @@ onUnmounted(() => {
   >
     <header class="app-header">
       <div class="brand">
-        <b>DKP</b><span>Registrator<small>임상사진 비교 작업대</small></span>
+        <b>DKP</b><span>Registrator <small data-testid="app-version">{{ appVersion }} · 임상사진 비교 작업대</small></span>
       </div>
       <button
         class="primary"

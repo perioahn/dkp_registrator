@@ -75,7 +75,8 @@ describe("focus-scoped shortcuts", () => {
       null,
     );
     expect(shortcut(key("KeyZ", { repeat: true }), "mask", false)).toBe(null);
-    expect(shortcut(key("KeyZ"), "compare", false)).toBe(null);
+    expect(shortcut(key("KeyZ"), "compare", false)).toBe("confirm");
+    expect(shortcut(key("KeyZ"), "adjust", false)).toBe(null);
   });
 });
 describe("coordinates", () => {

@@ -8,6 +8,8 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.error
+import re
 from PIL import Image, ImageDraw
 
 binary = Path('dist/DKPregistrator/DKPregistrator.exe') if sys.platform == 'win32' else Path('dist/DKPregistrator.app/Contents/MacOS/DKPregistrator')
@@ -31,7 +33,11 @@ with tempfile.TemporaryDirectory(prefix='dkp-native-smoke-') as temp:
                 time.sleep(1)
         assert state['images'] == [] and not state['running']
         with urllib.request.urlopen(base+'/') as response:
-            assert b'<script' in response.read()
+            html = response.read().decode()
+            asset = re.search(r'src="([^"]+\.js)"', html)[1]
+        with urllib.request.urlopen(base+asset) as response:
+            ui = response.read().decode()
+            assert '사진 추가' in ui and '기준 편집' in ui
         with urllib.request.urlopen(base+'/api/app') as response:
             identity=json.load(response)
         assert identity['version'] == '1.5.1'
@@ -51,12 +57,17 @@ with tempfile.TemporaryDirectory(prefix='dkp-native-smoke-') as temp:
         with urllib.request.urlopen(base+f"/api/image/{uploaded['ids'][0]}/source") as response:
             assert Image.open(io.BytesIO(response.read())).size == (256,256)
         image_id=uploaded['ids'][0]
-        request=urllib.request.Request(base+f'/api/mask/{image_id}/click', data=json.dumps({'x':128,'y':128,'label':1}).encode(), headers={'Content-Type':'application/json'})
+        request=urllib.request.Request(base+f'/api/mask/{image_id}/preview', data=json.dumps({'points':[{'x':128,'y':128,'label':1}]}).encode(), headers={'Content-Type':'application/json'})
         try:
             with urllib.request.urlopen(request, timeout=300) as response:
-                assert len(json.load(response)['points']) == 1
+                draft = json.load(response)
         except urllib.error.HTTPError as exc:
             raise RuntimeError(exc.read().decode()) from exc
+        with urllib.request.urlopen(base+'/api/state') as response:
+            assert not json.load(response)['images'][0]['mask_ready']
+        request=urllib.request.Request(base+f'/api/mask/{image_id}/action', data=json.dumps({'action':'confirm','draft_token':draft['token']}).encode(), headers={'Content-Type':'application/json'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            assert json.load(response)['n_objects'] == 1
         with urllib.request.urlopen(base+f'/api/mask/{image_id}/overlay') as response:
             overlay=Image.open(io.BytesIO(response.read()))
             assert overlay.getchannel('A').getextrema()[1] > 0

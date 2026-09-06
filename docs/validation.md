@@ -1,5 +1,9 @@
 # Workspace validation
 
+## 1.5.1 correction
+
+The original native smoke checked startup and image upload, not SAM inference. A real packaged mask click reproduced HTTP 500. The Mac diagnostic build reported `operator torchvision::nms does not exist`; both original archives lacked torchvision native libraries. New torchvision wheels use `_C_stable`, while the packaging hook collected the older `_C`. Packaging now explicitly includes the native library files. Release smoke requires real SAM preview, no premature mask commit, explicit confirmation and a nonempty overlay on each OS. Application identity is checked before session reuse so an older local server cannot reopen its old UI. Browser tests cover click-first A/Z selection and unified file input.
+
 Validated on Windows with Python 3.13, Node and Chromium on 2026-09-06.
 
 - Python API and engine: 30 tests covering reference changes, revision/history, masks, anchors, exports, failure isolation, immutable results and similarity geometry.

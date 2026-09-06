@@ -42,6 +42,25 @@ const pairs = ref<Anchor[]>([]),
   placing = ref(false),
   pending = ref<Point | null>(null),
   showAnchors = ref(true);
+const candidate = ref<{which: "left" | "right"; x: number; y: number} | null>(null);
+const preview = ref<{token: string; overlay: string; imageId: string} | null>(null);
+const previewBusy = ref(false);
+let previewSequence = 0;
+let previewPoints: {x:number; y:number; label:number}[] = [];
+let previewImage = "";
+function clearPreview() {
+  previewSequence++;
+  candidate.value = null;
+  preview.value = null;
+  previewBusy.value = false;
+  previewPoints = [];
+  previewImage = "";
+}
+function cancelInput() {
+  if (!candidate.value && !preview.value && !previewBusy.value && !pending.value) return false;
+  cancel();
+  return true;
+}
 let draggingPairs: Anchor[] | null = null;
 const pairKey = computed(() => `${props.fixed.id}:${props.current.id}`);
 const r = computed(() => props.current.result),
@@ -246,6 +265,7 @@ async function loadAnchors() {
 watch(
   [() => props.current.id, () => props.fixed.id],
   () => {
+    clearPreview();
     placing.value = false;
     pending.value = null;
     selectedPair.value = null;
@@ -259,14 +279,33 @@ watch(
 watch(
   () => props.revision,
   () => {
+    clearPreview();
     if (!busy.value) loadAnchors();
   },
 );
-function startAnchor() {
+async function startAnchor() {
   if (props.current.id === props.fixed.id) return;
-  emit("update:tool", "anchor");
+  emit("update:tool", "mask");
+  const pick = candidate.value;
+  if (pick) {
+    const img = pick.which === "left" ? props.fixed : props.current;
+    const point = inversePoint(img.G, [pick.x, pick.y]);
+    clearPreview();
+    if (pick.which === "left") {
+      pending.value = point;
+      placing.value = true;
+      selectedPair.value = null;
+    } else if (pending.value) {
+      const a = {id: crypto.randomUUID(), fixed: pending.value, moving: point, enabled: true};
+      if (await savePairs([...pairs.value, a])) {
+        selectedPair.value = a.id;
+        pending.value = null;
+        placing.value = false;
+      }
+    } else emit("error", "먼저 기준 사진을 클릭하고 A로 기준점을 선택하세요.");
+    return;
+  }
   placing.value = true;
-  pending.value = null;
   selectedPair.value = null;
 }
 async function savePairs(next: Anchor[]) {
@@ -295,6 +334,7 @@ async function savePairs(next: Anchor[]) {
 }
 async function deleteAnchor() {
   if (busy.value || props.running) return;
+  if (candidate.value) { clearPreview(); return; }
   if (pending.value || placing.value) {
     pending.value = null;
     placing.value = false;
@@ -306,6 +346,7 @@ async function deleteAnchor() {
   }
 }
 function cancel() {
+  clearPreview();
   pending.value = null;
   placing.value = false;
   if (gesture) {
@@ -319,26 +360,26 @@ async function click(
 ) {
   if (busy.value || props.running) return;
   const img = which === "left" ? props.fixed : props.current;
-  if (props.tool === "mask") {
+  if (isRaw.value && props.tool !== "adjust") {
     maskTarget.value = img.id;
-    busy.value = true;
+    if (p.button !== 2) candidate.value = {which, x:p.x, y:p.y};
+    if (previewImage !== img.id) previewPoints = [];
+    previewImage = img.id;
+    previewPoints.push({
+      x: Math.max(0, Math.min(img.w - 1, ((p.x + .5) * img.w) / img.full_w - .5)),
+      y: Math.max(0, Math.min(img.h - 1, ((p.y + .5) * img.h) / img.full_h - .5)),
+      label: p.button === 2 ? 0 : 1,
+    });
+    const sequence = ++previewSequence;
+    previewBusy.value = true;
+    preview.value = null;
     try {
-      await api(`/api/mask/${img.id}/click`, {
-        x: Math.max(
-          0,
-          Math.min(img.w - 1, ((p.x + 0.5) * img.w) / img.full_w - 0.5),
-        ),
-        y: Math.max(
-          0,
-          Math.min(img.h - 1, ((p.y + 0.5) * img.h) / img.full_h - 0.5),
-        ),
-        label: p.button === 2 ? 0 : 1,
-      });
-      emit("changed");
+      const result = await api(`/api/mask/${img.id}/preview`, {points: [...previewPoints]});
+      if (sequence === previewSequence) preview.value = {...result, imageId: img.id};
     } catch (e: any) {
-      emit("error", e.message);
+      if (sequence === previewSequence) emit("error", e.message);
     } finally {
-      busy.value = false;
+      if (sequence === previewSequence) previewBusy.value = false;
     }
     return;
   }
@@ -360,7 +401,7 @@ async function click(
   }
 }
 function points(which: "left" | "right") {
-  if (props.tool !== "anchor" || !showAnchors.value) return [];
+  if (!isRaw.value || !showAnchors.value) return [];
   const img = which === "left" ? props.fixed : props.current;
   const list = pairs.value
     .map((a, i) => {
@@ -388,13 +429,17 @@ function points(which: "left" | "right") {
       disabled: false,
     });
   }
+  if (candidate.value?.which === which) list.push({
+    id: "candidate", x:candidate.value.x, y:candidate.value.y,
+    label: "?", selected: true, disabled: false,
+  });
   return list;
 }
 async function dragAnchor(
   which: "left" | "right",
   p: { id: string; x: number; y: number; end: boolean; moved?: boolean },
 ) {
-  if (props.running || busy.value || p.id === "pending") return;
+  if (props.running || busy.value || p.id === "pending" || p.id === "candidate") return;
   selectedPair.value = p.id;
   if (p.end && !p.moved) return;
   if (!draggingPairs) draggingPairs = JSON.parse(JSON.stringify(pairs.value));
@@ -416,11 +461,15 @@ async function dragAnchor(
 }
 async function maskAction(action: "confirm" | "reset") {
   if (busy.value || props.running) return;
+  if (action === "confirm" && previewBusy.value) return;
+  const draft = preview.value;
   busy.value = true;
   try {
     await api(`/api/mask/${maskTarget.value || props.current.id}/action`, {
       action,
+      draft_token: action === "confirm" ? draft?.token : undefined,
     });
+    clearPreview();
     emit("changed");
   } catch (e: any) {
     emit("error", e.message);
@@ -457,25 +506,25 @@ async function applyAdjust(reset = false) {
     busy.value = false;
   }
 }
-defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo });
+defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, cancelInput });
 </script>
 <template>
   <section class="workspace-body">
-    <div class="context-toolbar" v-if="tool === 'mask'">
+    <div class="context-toolbar" v-if="isRaw && tool !== 'adjust'">
       <span>마스크 대상</span
       ><button
         :class="{ on: maskTarget === fixed.id }"
-        @click="maskTarget = fixed.id"
+        @click="clearPreview(); maskTarget = fixed.id"
       >
         기준 사진</button
       ><button
         v-if="current.id !== fixed.id"
         :class="{ on: maskTarget === current.id }"
-        @click="maskTarget = current.id"
+        @click="clearPreview(); maskTarget = current.id"
       >
         현재 사진
       </button>
-      <button :disabled="busy || running" @click="maskAction('confirm')">
+      <button :disabled="busy || running || previewBusy || !preview" @click="maskAction('confirm')">
         개체 확정 <kbd>Z</kbd></button
       ><button :disabled="busy || running" @click="maskAction('reset')">
         마스크 초기화 <kbd>X</kbd>
@@ -489,16 +538,16 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo });
         max="1"
         step=".05"
       />
-      <span class="subtle">좌클릭 포함 · 우클릭 제외</span>
+      <span class="subtle">클릭 → A 대응점 / Z 마스크 · 우클릭 제외</span>
     </div>
-    <div class="context-toolbar" v-if="tool === 'anchor'">
+    <div class="context-toolbar" v-if="isRaw && tool !== 'adjust'">
       <button
         :disabled="busy || running || current.id === fixed.id"
         @click="startAnchor"
       >
-        대응점 추가 <kbd>A</kbd></button
+        대응점 선택 <kbd>A</kbd></button
       ><button
-        :disabled="busy || running || (!selectedPair && !placing)"
+        :disabled="busy || running || (!selectedPair && !placing && !candidate)"
         @click="deleteAnchor"
       >
         선택/입력 취소 <kbd>D</kbd>
@@ -507,9 +556,9 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo });
       <span class="instruction">{{
         placing
           ? pending
-            ? "오른쪽 사진의 같은 위치를 찍으세요"
-            : "왼쪽 기준 사진의 위치를 찍으세요"
-          : "번호를 선택하거나 드래그하여 대응점을 수정하세요"
+            ? "현재 사진을 클릭하고 A로 대응점을 확정하세요"
+            : "기준 사진을 클릭하고 A로 선택하세요"
+          : "점은 아직 저장되지 않았습니다. A 또는 Z로 용도를 결정하세요"
       }}</span>
       <div class="anchor-list">
         <button
@@ -582,13 +631,13 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo });
         :view="leftView"
         @update:view="updateView('left', $event)"
         :region-url="leftRegion"
-        :interactive="tool === 'mask' || tool === 'anchor'"
+        :interactive="isRaw && tool !== 'adjust'"
         @point="click('left', $event)"
         :points="points('left')"
         @anchor="dragAnchor('left', $event)"
         :overlay="
-          tool === 'mask' && maskVisible
-            ? `/api/mask/${fixed.id}/overlay?v=${revision}`
+          maskVisible
+            ? preview?.imageId === fixed.id ? preview.overlay : `/api/mask/${fixed.id}/overlay?v=${revision}`
             : undefined
         "
         :opacity="opacity"
@@ -606,13 +655,13 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo });
         :view="rightView"
         @update:view="updateView('right', $event)"
         :region-url="rightRegion"
-        :interactive="tool === 'mask' || tool === 'anchor'"
+        :interactive="isRaw && tool !== 'adjust'"
         @point="click('right', $event)"
         :points="points('right')"
         @anchor="dragAnchor('right', $event)"
         :overlay="
-          tool === 'mask' && maskVisible
-            ? `/api/mask/${current.id}/overlay?v=${revision}`
+          maskVisible
+            ? preview?.imageId === current.id ? preview.overlay : `/api/mask/${current.id}/overlay?v=${revision}`
             : undefined
         "
         :opacity="opacity"
@@ -704,7 +753,7 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo });
           v-model.number="opacity"
       /></label>
       <span class="spacer" /><span class="subtle">{{
-        busy ? "처리 중…" : "휠 확대 · Space+드래그 이동"
+        previewBusy ? "마스크 미리보기 생성 중… 첫 사용은 모델 다운로드가 필요합니다. A 선택 가능" : busy ? "처리 중…" : "휠 확대 · Space+드래그 이동"
       }}</span>
     </div>
   </section>

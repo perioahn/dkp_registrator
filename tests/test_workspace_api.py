@@ -58,6 +58,24 @@ def test_mask_failure_is_actionable_and_keeps_state(client, monkeypatch):
     assert after['history'] == before['history']
 
 
+def test_preview_is_uncommitted_until_z_and_rejects_stale_commit(client):
+    image_id = add(client, 1)[0]
+    before = client.get('/api/state').json()
+    r = client.post(f'/api/mask/{image_id}/preview', json={'points': [{'x':20,'y':20,'label':1}]})
+    assert r.status_code == 200, r.text
+    draft = r.json()
+    assert draft['overlay'].startswith('data:image/png;base64,')
+    after = client.get('/api/state').json()
+    assert after['images'][0]['mask_ready'] is False
+    assert after['history'] == before['history']
+    r = client.post(f'/api/mask/{image_id}/action', json={'action':'confirm','draft_token':draft['token']})
+    assert r.status_code == 200, r.text
+    assert client.get('/api/state').json()['images'][0]['n_objects'] == 1
+    client.post('/api/history/undo')
+    assert client.get('/api/state').json()['images'][0]['mask_ready'] is False
+    assert client.post(f'/api/mask/{image_id}/action', json={'action':'confirm','draft_token':draft['token']}).status_code == 409
+
+
 def test_upload_rejects_individually_and_default_fixed(client):
     r = client.post("/api/upload", files=[("files", ("bad.png", b"invalid", "image/png")), ("files", ("ok.png", png(np.zeros((20, 30, 3), np.uint8)), "image/png"))])
     assert r.status_code == 200

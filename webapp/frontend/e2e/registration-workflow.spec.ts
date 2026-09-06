@@ -29,6 +29,29 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
 });
 
+test("click first, then A selects anchor or Z commits mask without choosing a tool", async ({ page }) => {
+  await upload(page, 2);
+  await expect(page.locator('input[type=file]')).toHaveCount(1);
+  const panes = page.locator('.photo-viewport');
+  await panes.first().click({ position: { x: 160, y: 140 } });
+  await expect(page.locator('[data-anchor="candidate"]')).toBeVisible();
+  await page.keyboard.press('a');
+  await panes.last().click({ position: { x: 160, y: 140 } });
+  await page.keyboard.press('a');
+  await expect.poll(async () => {
+    const s = await state(page);
+    return (await (await page.request.get(`/api/anchors/${s.images[1].id}`)).json()).pairs.length;
+  }).toBe(1);
+  let s = await state(page);
+  expect(s.images.every((p: any) => !p.mask_ready)).toBe(true);
+  await panes.last().click({ position: { x: 200, y: 160 } });
+  await expect(page.getByRole('button', {name: '개체 확정 Z', exact:true})).toBeEnabled();
+  await page.keyboard.press('z');
+  await expect.poll(async () => (await state(page)).images[1].n_objects).toBe(1);
+  await page.keyboard.press('Control+z');
+  await expect.poll(async () => (await state(page)).images[1].n_objects).toBe(0);
+});
+
 test("upload, fifth result, preserve checks and navigation, save selected", async ({
   page,
 }) => {
@@ -69,12 +92,10 @@ test("mask Z/X undo restores prompts; C and form shortcuts do nothing", async ({
   page,
 }) => {
   await upload(page, 3);
-  await page.getByRole("button", { name: "마스크", exact: true }).click();
+  await page.getByRole("button", { name: "점·마스크", exact: true }).click();
   const pane = page.locator(".photo-viewport").nth(1);
   await pane.click({ position: { x: 150, y: 150 } });
-  await expect
-    .poll(async () => (await state(page)).images[1].mask_points.length)
-    .toBe(1);
+  await expect(page.locator('[data-anchor="candidate"]')).toBeVisible();
   await expect(page.getByRole("button", { name: /개체 확정/ })).toBeEnabled();
   await pane.press("KeyZ");
   await expect
@@ -94,7 +115,7 @@ test("mask Z/X undo restores prompts; C and form shortcuts do nothing", async ({
   await pane.press("Control+z");
   await expect
     .poll(async () => (await state(page)).images[1].mask_points.length)
-    .toBe(1);
+    .toBe(0);
   let rev = (await state(page)).revision;
   await pane.press("KeyC");
   expect((await state(page)).revision).toBe(rev);
@@ -111,10 +132,12 @@ test("anchors and changing fixed preserve pair state; review queue advances", as
     .locator(".photo-viewport")
     .nth(0)
     .click({ position: { x: 150, y: 150 } });
+  await page.keyboard.press("KeyA");
   await page
     .locator(".photo-viewport")
     .nth(1)
     .click({ position: { x: 180, y: 150 } });
+  await page.keyboard.press("KeyA");
   await expect(page.locator(".anchor-dot")).toHaveCount(2);
   await page.locator(".work-surface").focus();
   await page.keyboard.press("KeyD");

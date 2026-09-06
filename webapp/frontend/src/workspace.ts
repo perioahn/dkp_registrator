@@ -141,9 +141,11 @@ export function shortcut(e: Key, tool: Tool, editing: boolean): string | null {
   if (e.code === "ArrowLeft") return "previous";
   if (e.code === "ArrowRight") return "next";
   if (e.code === "KeyA") return "anchor";
-  if (e.code === "KeyD" && tool === "anchor") return "delete-anchor";
-  if (tool === "mask" && e.code === "KeyZ") return "confirm";
-  if (tool === "mask" && e.code === "KeyX") return "reset-mask";
+  if (tool !== "adjust" && tool !== "edit") {
+    if (e.code === "KeyD") return "delete-anchor";
+    if (e.code === "KeyZ") return "confirm";
+    if (e.code === "KeyX") return "reset-mask";
+  }
   return null;
 }
 export function zoomAt(

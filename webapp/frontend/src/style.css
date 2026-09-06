@@ -1075,3 +1075,8 @@ small,
   padding: 3px 6px;
   font-size: 12px;
 }
+.anchor-dot[data-anchor="candidate"] {
+  border: 2px dashed #f1c77e;
+  background: #302818;
+  color: #ffe0a9;
+}
