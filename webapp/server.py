@@ -18,6 +18,8 @@ import sys
 import threading
 import time
 import uuid
+import hashlib
+import socket
 from collections import OrderedDict
 
 import cv2
@@ -44,6 +46,7 @@ from register import (  # noqa: E402
 )
 
 log = logging.getLogger(__name__)
+APP_VERSION = "1.5.1"
 
 SAM2_MAX_SIDE = 1024
 
@@ -314,6 +317,12 @@ def _mask_overlay_png(img_id: str) -> bytes:
 app = FastAPI(title="dkp-registrator-web")
 
 
+@app.get("/api/app")
+def app_identity():
+    return {"application": "dkp-registrator", "version": APP_VERSION,
+            "build": APP_BUILD}
+
+
 @app.middleware("http")
 async def local_guard(request: Request, call_next):
     host = (request.headers.get("host") or "").split(":")[0]
@@ -346,7 +355,7 @@ def state() -> dict:
                 "mask_rev": st.get("rev", 0), "mask_points": st.get("points", []),
                 "result": _result_summary(SESSION.results.get(i)),
             }
-        return {"images": [img_info(i) for i in SESSION.order],
+        return {"version": APP_VERSION, "images": [img_info(i) for i in SESSION.order],
                 "fixed": SESSION.fixed_id(), "fixed_id": SESSION.fixed_id(),
                 "revision": SESSION.revision, "running": SESSION.running,
                 "job": snapshot(SESSION.job), "history": SESSION.history.labels(),
@@ -518,9 +527,10 @@ def _mutate_mask(img_id, action, point=None):
             st["points"].append({"x": x, "y": y, "label": label})
             try:
                 _predict_mask(img_id)
-            except Exception:
+            except Exception as exc:
                 SESSION.masks[img_id] = before["masks"].get(img_id, {"points": [], "confirmed": [], "current": None, "rev": 0})
-                raise
+                log.exception("SAM mask prediction failed")
+                raise HTTPException(503, f"마스크 생성 실패: {type(exc).__name__}: {exc}. 최초 사용 시 모델 다운로드를 위한 인터넷 연결을 확인하세요.") from exc
         elif action == "confirm":
             if st["current"] is None:
                 return {"points": st["points"], "n_objects": len(st["confirmed"])}
@@ -1101,8 +1111,32 @@ _DIST_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist"),
 ]
 DIST = next((d for d in _DIST_CANDIDATES if d and os.path.isdir(d)), None)
+APP_BUILD = APP_VERSION
+if DIST:
+    with open(os.path.join(DIST, "index.html"), "rb") as _index:
+        APP_BUILD += "-" + hashlib.sha256(_index.read()).hexdigest()[:12]
 if DIST:
     app.mount("/", StaticFiles(directory=DIST, html=True), name="static")
+
+
+def choose_listener(preferred_port):
+    """Reuse only this build; reserve a new port without touching another session."""
+    import urllib.request
+    for port in range(preferred_port, min(preferred_port + 30, 65536)):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/app", timeout=1) as response:
+                if json.load(response) == app_identity():
+                    return port, None
+        except Exception:
+            pass
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", port))
+            listener.listen(128)
+            return port, listener
+        except OSError:
+            listener.close()
+    raise RuntimeError("사용할 포트가 없습니다. 실행 중인 Registrator 창을 확인하세요.")
 
 
 def main():
@@ -1117,23 +1151,32 @@ def main():
                     help="브라우저를 닫아도 서버 유지 (개발용)")
     args = ap.parse_args()
 
-    # 이미 실행 중이면 새로 띄우지 않고 브라우저만 (포트 충돌로 옛 세션이 보이는 문제 방지)
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/api/state", timeout=2):
-            print("이미 실행 중 - 브라우저만 엽니다")
-            if not args.no_browser:
-                webbrowser.open(f"http://127.0.0.1:{args.port}/")
-            return
-    except Exception:
-        pass
+    port, listener = choose_listener(args.port)
+    url = f"http://127.0.0.1:{port}/"
+    if listener is None:
+        if not args.no_browser:
+            webbrowser.open(url)
+        return
     if not args.persist:
         threading.Thread(target=_auto_shutdown_loop, daemon=True,
                          name="auto-exit").start()
     if not args.no_browser:
-        threading.Timer(1.5, lambda: webbrowser.open(
-            f"http://127.0.0.1:{args.port}/")).start()
+        def open_ready():
+            for _ in range(90):
+                try:
+                    with urllib.request.urlopen(url + "api/app", timeout=1) as response:
+                        if json.load(response) == app_identity():
+                            webbrowser.open(url)
+                            return
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        threading.Thread(target=open_ready, daemon=True).start()
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    try:
+        uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")).run(sockets=[listener])
+    finally:
+        listener.close()
 
 
 if __name__ == "__main__":

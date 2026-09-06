@@ -44,6 +44,20 @@ def test_import_session_preserves_existing_directory(tmp_path):
     assert (old / "keep.txt").read_text() == "keep"
 
 
+def test_mask_failure_is_actionable_and_keeps_state(client, monkeypatch):
+    image_id = add(client, 1)[0]
+    def failure(_):
+        raise RuntimeError('model configuration missing')
+    monkeypatch.setattr(s, '_predict_mask', failure)
+    before = client.get('/api/state').json()
+    r = client.post(f'/api/mask/{image_id}/click', json={'x': 20, 'y': 20, 'label': 1})
+    assert r.status_code == 503
+    assert 'model configuration missing' in r.json()['detail']
+    after = client.get('/api/state').json()
+    assert after['images'][0]['mask_points'] == []
+    assert after['history'] == before['history']
+
+
 def test_upload_rejects_individually_and_default_fixed(client):
     r = client.post("/api/upload", files=[("files", ("bad.png", b"invalid", "image/png")), ("files", ("ok.png", png(np.zeros((20, 30, 3), np.uint8)), "image/png"))])
     assert r.status_code == 200
