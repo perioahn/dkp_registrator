@@ -11,19 +11,18 @@ import os
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # macOS: 미지원 MPS 연산 per-op CPU 폴백
 
 import asyncio
-import base64
 import io
 import json
 import logging
-import shutil
 import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 import cv2
 import numpy as np
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -72,31 +71,18 @@ def data_dir() -> str:
 
 # ── 세션 (단일 활성) ────────────────────────────────
 
-class Session:
-    """이미지·마스크·앵커·결과를 담는 단일 작업 세션."""
+from webapp.session_state import Session as WorkspaceSession
+from webapp.history import HistoryConflict, snapshot
+from transform import is_similarity
 
-    def __init__(self):
-        self.dir = os.path.join(data_dir(), "session")
-        shutil.rmtree(self.dir, ignore_errors=True)
-        os.makedirs(self.dir)
-        self.images: dict[str, dict] = {}   # id → {role, name, path}
-        self.order: list[str] = []          # 업로드 순서 (fixed 먼저)
-        self.masks: dict[str, dict] = {}    # id → {points:[], confirmed:[np], current:np|None}
-        self.results: dict[str, dict] = {}  # moving_id → result entry
-        self.running = False
-
-    def fixed_id(self) -> str | None:
-        return next((i for i in self.order
-                     if self.images[i]["role"] == "fixed"), None)
-
-    def moving_ids(self) -> list[str]:
-        return [i for i in self.order if self.images[i]["role"] == "moving"]
-
+class Session(WorkspaceSession):
+    def __init__(self, root=None):
+        super().__init__(root or os.environ.get("DKP_SESSION_ROOT") or data_dir())
 
 SESSION = Session()
 
 _img_cache: dict[str, np.ndarray] = {}   # id → RGB (SAM2_MAX_SIDE 제한)
-_full_cache: dict[str, np.ndarray] = {}  # id → RGB 원본
+_full_cache: OrderedDict[str, np.ndarray] = OrderedDict()  # bounded original-resolution cache
 
 
 def _load_rgb(path: str) -> np.ndarray:
@@ -108,22 +94,67 @@ def _load_rgb(path: str) -> np.ndarray:
 
 
 def get_full(img_id: str) -> np.ndarray:
-    if img_id not in _full_cache:
-        _full_cache[img_id] = _load_rgb(SESSION.images[img_id]["path"])
-    return _full_cache[img_id]
+    with SESSION.lock:
+        _require_image(img_id)
+        if img_id not in _full_cache:
+            _full_cache[img_id] = _load_rgb(SESSION.images[img_id]["path"])
+            while len(_full_cache) > 4:
+                _full_cache.popitem(last=False)
+        _full_cache.move_to_end(img_id)
+        return _full_cache[img_id]
+
+
+def _require_image(img_id):
+    if img_id not in SESSION.images:
+        raise HTTPException(404, "사진을 찾을 수 없습니다")
+    return SESSION.images[img_id]
+
+
+def _require_idle():
+    if SESSION.running:
+        raise HTTPException(409, "현재 사진 정합을 마친 뒤 변경할 수 있습니다")
+
+
+def _invalidate_images():
+    global _sam_current
+    _full_cache.clear()
+    _img_cache.clear()
+    _sam_current = None
+
+
+def _record(label, image_id, before):
+    SESSION.record(label, image_id, before)
+
+
+def _pixel_scale(sx, sy):
+    """Pixel-center mapping used by OpenCV resize, including rounded x/y dimensions."""
+    return np.array([[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]])
+
+
+def _freshness(r):
+    if not r:
+        return "stale"
+    f, m = SESSION.images.get(r.get("fixed_id")), SESSION.images.get(r.get("moving_id"))
+    key = (r.get("fixed_id"), r.get("moving_id"))
+    same = f and m and f["revision"] == r.get("fixed_revision") and m["revision"] == r.get("moving_revision")
+    same = same and r.get("anchor_revision", 0) == SESSION.anchors.get(key, {}).get("revision", 0)
+    same = same and r.get("fixed_mask_revision", 0) == SESSION.masks.get(r.get("fixed_id"), {}).get("rev", 0)
+    same = same and r.get("moving_mask_revision", 0) == SESSION.masks.get(r.get("moving_id"), {}).get("rev", 0)
+    return "current" if same else "stale"
 
 
 def get_work(img_id: str) -> np.ndarray:
     """SAM2/화면용 축소본 (최대 1024px)."""
-    if img_id not in _img_cache:
-        full = get_full(img_id)
-        h, w = full.shape[:2]
-        s = SAM2_MAX_SIDE / max(h, w)
-        if s < 1:
-            full = cv2.resize(full, (int(w * s), int(h * s)),
-                              interpolation=cv2.INTER_AREA)
-        _img_cache[img_id] = full
-    return _img_cache[img_id]
+    with SESSION.lock:
+        if img_id not in _img_cache:
+            full = get_full(img_id)
+            h, w = full.shape[:2]
+            s = SAM2_MAX_SIDE / max(h, w)
+            if s < 1:
+                full = cv2.resize(full, (max(1, int(w * s)), max(1, int(h * s))),
+                                  interpolation=cv2.INTER_AREA)
+            _img_cache[img_id] = full
+        return _img_cache[img_id]
 
 
 def work_scale(img_id: str) -> float:
@@ -210,8 +241,30 @@ def _sam_select(img_id: str) -> None:
 
 
 def _mask_state(img_id: str) -> dict:
+    _require_image(img_id)
     return SESSION.masks.setdefault(
         img_id, {"points": [], "confirmed": [], "current": None, "rev": 0})
+
+
+def _project_mask(img_id, part):
+    """Reproject from its immutable generation frame, never from a previous projection."""
+    if isinstance(part, np.ndarray):
+        return part
+    im = SESSION.images[img_id]
+    work = get_work(img_id)
+    full = get_full(img_id)
+    S = _pixel_scale(work.shape[1] / full.shape[1], work.shape[0] / full.shape[0])
+    M = S @ np.asarray(im["G"]) @ np.linalg.inv(part["G"])
+    return cv2.warpAffine(part["mask"].astype(np.uint8), M[:2], (work.shape[1], work.shape[0]), flags=cv2.INTER_NEAREST).astype(bool)
+
+
+def _freeze_mask(img_id, mask):
+    if mask is None or isinstance(mask, dict):
+        return mask
+    im = SESSION.images[img_id]
+    h, w = get_full(img_id).shape[:2]
+    S = _pixel_scale(mask.shape[1] / w, mask.shape[0] / h)
+    return {"mask": mask.copy(), "G": S @ np.asarray(im["G"]), "revision": im["revision"]}
 
 
 def _predict_mask(img_id: str) -> None:
@@ -238,7 +291,7 @@ def _union_mask(img_id: str) -> np.ndarray | None:
         return None
     u = np.zeros(get_work(img_id).shape[:2], dtype=bool)
     for m in parts:
-        u |= m
+        u |= _project_mask(img_id, m)
     return (u * 255).astype(np.uint8)
 
 
@@ -248,9 +301,9 @@ def _mask_overlay_png(img_id: str) -> bytes:
     h, w = get_work(img_id).shape[:2]
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     for m in st["confirmed"]:
-        rgba[m] = (60, 120, 255, 110)
+        rgba[_project_mask(img_id, m)] = (60, 120, 255, 110)
     if st["current"] is not None:
-        cur = st["current"]
+        cur = _project_mask(img_id, st["current"])
         rgba[cur] = (255, 210, 40, 130)
     ok, buf = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
     return buf.tobytes()
@@ -277,92 +330,160 @@ async def startup():
 
 @app.get("/api/state")
 def state() -> dict:
-    def img_info(i):
-        st = SESSION.masks.get(i, {})
-        work = get_work(i)
-        return {
-            "id": i, "role": SESSION.images[i]["role"],
-            "name": SESSION.images[i]["name"],
-            "w": work.shape[1], "h": work.shape[0],
-            "n_objects": len(st.get("confirmed", [])),
-            "has_current": st.get("current") is not None,
-            "mask_ready": _union_mask(i) is not None,
-            "mask_rev": st.get("rev", 0),  # 미니맵 오버레이 캐시버스터
-            "result": _result_summary(SESSION.results.get(i)),
-        }
-    return {
-        "images": [img_info(i) for i in SESSION.order],
-        "fixed": SESSION.fixed_id(),
-        "running": SESSION.running,
-        "profiles": list(PROFILES),
-        "device": _torch_device(),
-    }
+    with SESSION.lock:
+        def img_info(i):
+            st = SESSION.masks.get(i, {})
+            work, im = get_work(i), SESSION.images[i]
+            return {
+                "id": i, "role": im["role"], "name": im["name"],
+                "w": work.shape[1], "h": work.shape[0],
+                "full_w": im["full_w"], "full_h": im["full_h"],
+                "source_w": im["source_w"], "source_h": im["source_h"],
+                "revision": im["revision"], "G": im["G"], "edits": im["edits"],
+                "n_objects": len(st.get("confirmed", [])),
+                "has_current": st.get("current") is not None,
+                "mask_ready": _union_mask(i) is not None,
+                "mask_rev": st.get("rev", 0), "mask_points": st.get("points", []),
+                "result": _result_summary(SESSION.results.get(i)),
+            }
+        return {"images": [img_info(i) for i in SESSION.order],
+                "fixed": SESSION.fixed_id(), "fixed_id": SESSION.fixed_id(),
+                "revision": SESSION.revision, "running": SESSION.running,
+                "job": snapshot(SESSION.job), "history": SESSION.history.labels(),
+                "profiles": list(PROFILES), "device": _torch_device()}
 
 
 def _result_summary(r: dict | None) -> dict | None:
     if not r:
         return None
     m = r.get("metrics") or {}
+    freshness = _freshness(r)
     return {
+        "id": r.get("id"), "fixed_id": r.get("fixed_id"),
+        "fixed_revision": r.get("fixed_revision"), "moving_revision": r.get("moving_revision"),
+        "full_w": r.get("fixed_img", np.empty((0, 0))).shape[1],
+        "full_h": r.get("fixed_img", np.empty((0, 0))).shape[0],
+        "freshness": freshness,
+        "review_status": r.get("review_status", "unreviewed") if freshness == "current" else "needs_work",
+        "latest_attempt_failed": bool(r.get("latest_attempt_failed")),
+        "latest_attempt_reason": r.get("latest_attempt_reason"),
+        "has_previous": r.get("previous") is not None,
+        "previous": {"id": r["previous"]["id"], "full_w": r["previous"]["fixed_img"].shape[1],
+                     "full_h": r["previous"]["fixed_img"].shape[0],
+                     "fixed_id": r["previous"]["fixed_id"], "fixed_revision": r["previous"]["fixed_revision"]}
+                    if r.get("previous") else None,
         "status": r.get("status"), "gate": r.get("gate"),
         "label": r.get("label"), "reason": r.get("reason"),
         "n_inlier": m.get("n_inlier"), "inlier_ratio": m.get("inlier_ratio"),
         "reproj_median": m.get("reproj_median"),
         "rotation_deg": m.get("rotation_deg"), "scale": m.get("scale"),
+        "anchor_residuals": m.get("anchor_residuals", []),
         "manual_adjusted": bool(r.get("manual_adjusted")),
-        "used_mask": bool(r.get("used_mask")),
+        "used_mask": bool(r.get("used_mask")), "job_id": r.get("job_id"),
     }
 
 
 @app.post("/api/reset")
 def reset() -> dict:
-    global SESSION, _img_cache, _full_cache, _sam_current
-    if SESSION.running:
-        raise HTTPException(409, "정합 실행 중")
-    SESSION = Session()
-    _img_cache = {}
-    _full_cache = {}
-    _sam_current = None
+    global SESSION
+    with SESSION.lock:
+        _require_idle()
+        SESSION = Session()
+        _invalidate_images()
     return {"ok": True}
 
 
 @app.post("/api/upload")
-async def upload(role: str, files: list[UploadFile] = File(...)) -> dict:
-    if role not in ("fixed", "moving"):
-        raise HTTPException(400, "role must be fixed|moving")
-    if role == "fixed" and SESSION.fixed_id():
-        raise HTTPException(409, "fixed는 1장만 — 기존 것을 삭제하세요")
-    added = []
+async def upload(files: list[UploadFile] = File(...), role: str | None = None) -> dict:
+    added, rejected = [], []
     for f in files:
-        img_id = uuid.uuid4().hex[:8]
-        ext = os.path.splitext(f.filename or "img.jpg")[1] or ".jpg"
-        path = os.path.join(SESSION.dir, img_id + ext)
-        with open(path, "wb") as out:
-            out.write(await f.read())
+        contents = await f.read()
+        with SESSION.lock:
+            _require_idle()
+            img_id = uuid.uuid4().hex
+            path = os.path.join(SESSION.dir, img_id + ".png")
+            try:
+                from PIL import Image, ImageOps
+                original = Image.open(io.BytesIO(contents))
+                if original.format not in ("JPEG", "PNG"):
+                    raise ValueError("JPEG/PNG 사진을 선택하세요")
+                original = ImageOps.exif_transpose(original)
+                rgb = np.array(original.convert("RGB"))
+                Image.fromarray(rgb).save(path, format="PNG")
+            except Exception as e:
+                rejected.append({"name": f.filename, "reason": str(e)})
+                continue
+            SESSION.images[img_id] = {
+                "role": "moving", "name": os.path.basename((f.filename or "photo.png").replace("\\", "/")),
+                "path": path, "source_path": path, "source_w": rgb.shape[1], "source_h": rgb.shape[0],
+                "full_w": rgb.shape[1], "full_h": rgb.shape[0],
+                "revision": 0, "edits": {}, "G": np.eye(3).tolist(),
+            }
+            SESSION.order.append(img_id)
+            if SESSION.fixed_id() is None:
+                SESSION.set_fixed(img_id)
+            SESSION.revision += 1
+            SESSION.history.redo.clear()
+            added.append(img_id)
+    return {"added": added, "ids": added, "rejected": rejected, "fixed_id": SESSION.fixed_id()}
+
+
+@app.post("/api/fixed")
+def set_fixed(image_id: str = Body(embed=True), base_revision: int | None = Body(default=None, embed=True)):
+    with SESSION.lock:
+        _require_image(image_id)
+        if base_revision is not None and base_revision != SESSION.revision:
+            raise HTTPException(409, "작업 상태가 바뀌었습니다. 새로 확인하세요")
+        if SESSION.running:
+            SESSION.pending_fixed = image_id
+            SESSION.job["stop_requested"] = True
+            return {"queued": True, "image_id": image_id}
+        if image_id != SESSION.fixed_id():
+            before = SESSION.snapshot()
+            SESSION.set_fixed(image_id)
+            _record("기준 사진 변경", image_id, before)
+        return {"ok": True, "fixed_id": image_id, "revision": SESSION.revision}
+
+
+@app.post("/api/history/{direction}")
+def history_action(direction: str):
+    with SESSION.lock:
+        _require_idle()
+        if direction not in ("undo", "redo"):
+            raise HTTPException(400)
+        source, dest = (SESSION.history.undo, SESSION.history.redo) if direction == "undo" else (SESSION.history.redo, SESSION.history.undo)
+        if not source:
+            raise HTTPException(409, "되돌릴 작업이 없습니다")
+        command = source[-1]
         try:
-            _load_rgb(path)  # 로드 가능 검증
-        except Exception:
-            os.remove(path)
-            raise HTTPException(400, f"이미지 로드 실패: {f.filename}")
-        SESSION.images[img_id] = {"role": role, "name": f.filename, "path": path}
-        SESSION.order.append(img_id)
-        added.append(img_id)
-        if role == "fixed":
-            break  # fixed는 첫 파일만
-    return {"added": added}
+            SESSION.restore(command["after" if direction == "undo" else "before"],
+                            command["before" if direction == "undo" else "after"])
+        except HistoryConflict as e:
+            raise HTTPException(409, str(e))
+        source.pop()
+        dest.append(command)
+        _invalidate_images()
+        return {"image_id": command["image_id"], "label": command["label"], "revision": SESSION.revision}
 
 
 @app.post("/api/image/{img_id}/delete")
 def delete_image(img_id: str) -> dict:
-    if img_id not in SESSION.images:
-        raise HTTPException(404)
-    SESSION.order.remove(img_id)
-    SESSION.images.pop(img_id)
-    SESSION.masks.pop(img_id, None)
-    SESSION.results.pop(img_id, None)
-    _img_cache.pop(img_id, None)
-    _full_cache.pop(img_id, None)
-    return {"ok": True}
+    with SESSION.lock:
+        _require_idle()
+        _require_image(img_id)
+        before = SESSION.snapshot()
+        SESSION.order.remove(img_id)
+        SESSION.images.pop(img_id)
+        SESSION.masks.pop(img_id, None)
+        if SESSION.fixed_id() == img_id:
+            SESSION.set_fixed(SESSION.order[0] if SESSION.order else None)
+        SESSION.anchors = {k: v for k, v in SESSION.anchors.items() if img_id not in k}
+        SESSION.result_pairs.pop(img_id, None)
+        for results in SESSION.result_pairs.values():
+            results.pop(img_id, None)
+        _record("사진 삭제", img_id, before)
+        _invalidate_images()
+        return {"ok": True}
 
 
 @app.get("/api/image/{img_id}")
@@ -383,47 +504,186 @@ def mask_overlay(img_id: str):
                              media_type="image/png")
 
 
+def _mutate_mask(img_id, action, point=None):
+    # SAM selection, prediction and history commit are one serialized action.
+    with SESSION.lock:
+        _require_idle()
+        st = _mask_state(img_id)
+        before = SESSION.snapshot()
+        if action == "click":
+            x, y, label = point
+            h, w = get_work(img_id).shape[:2]
+            if not np.isfinite([x, y]).all() or not (0 <= x < w and 0 <= y < h) or label not in (0, 1):
+                raise HTTPException(422, "마스크 점이 사진 범위 밖입니다")
+            st["points"].append({"x": x, "y": y, "label": label})
+            try:
+                _predict_mask(img_id)
+            except Exception:
+                SESSION.masks[img_id] = before["masks"].get(img_id, {"points": [], "confirmed": [], "current": None, "rev": 0})
+                raise
+        elif action == "confirm":
+            if st["current"] is None:
+                return {"points": st["points"], "n_objects": len(st["confirmed"])}
+            st["confirmed"].append(_freeze_mask(img_id, st["current"]))
+            st["points"], st["current"] = [], None
+        elif action == "reset":
+            st["points"], st["confirmed"], st["current"] = [], [], None
+        else:
+            raise HTTPException(400, "지원하지 않는 마스크 작업")
+        st["current"] = _freeze_mask(img_id, st["current"])
+        st["rev"] += 1
+        _record({"click": "마스크 점 추가", "confirm": "마스크 확정", "reset": "마스크 초기화"}[action], img_id, before)
+        return {"points": st["points"], "n_objects": len(st["confirmed"]), "ts": time.time_ns()}
+
+
 @app.post("/api/mask/{img_id}/click")
-async def mask_click(img_id: str, x: float = Body(embed=True),
-                     y: float = Body(embed=True),
-                     label: int = Body(embed=True)) -> dict:
-    """캔버스 클릭 (label 1=포함, 0=제외) → SAM2 예측."""
-    if img_id not in SESSION.images:
-        raise HTTPException(404)
-    st = _mask_state(img_id)
-    st["points"].append({"x": x, "y": y, "label": label})
-    st["rev"] = st.get("rev", 0) + 1
-    await asyncio.to_thread(_predict_mask, img_id)
-    return {"points": st["points"], "ts": time.time_ns()}
+async def mask_click(img_id: str, x: float = Body(embed=True), y: float = Body(embed=True), label: int = Body(embed=True)):
+    return await asyncio.to_thread(_mutate_mask, img_id, "click", (x, y, label))
 
 
 @app.post("/api/mask/{img_id}/action")
-async def mask_action(img_id: str, action: str = Body(embed=True)) -> dict:
-    """confirm(개체 확정=Z) / undo(마지막 점 취소) / reset(전체 초기화=X)."""
-    st = _mask_state(img_id)
-    if action == "confirm":
-        if st["current"] is not None:
-            st["confirmed"].append(st["current"])
-        st["points"] = []
-        st["current"] = None
-    elif action == "undo":
-        if st["points"]:
-            st["points"].pop()
-            await asyncio.to_thread(_predict_mask, img_id)
-        elif st["confirmed"]:
-            st["confirmed"].pop()
-    elif action == "reset":
-        st["points"] = []
-        st["confirmed"] = []
-        st["current"] = None
-    else:
-        raise HTTPException(400, "unknown action")
-    st["rev"] = st.get("rev", 0) + 1
-    return {"n_objects": len(st["confirmed"]), "points": st["points"],
-            "ts": time.time_ns()}
+async def mask_action(img_id: str, action: str = Body(embed=True)):
+    if action == "undo":
+        return history_action("undo")
+    return await asyncio.to_thread(_mutate_mask, img_id, action)
 
 
-# ── 정합 실행 ──────────────────────────────────────
+def _anchor_state(mid):
+    _require_image(mid)
+    if not SESSION.fixed_id() or mid == SESSION.fixed_id():
+        raise HTTPException(409, "비교할 사진을 선택하세요")
+    return SESSION.anchors.setdefault((SESSION.fixed_id(), mid), {"pairs": [], "revision": 0})
+
+
+def _project_point(img_id, point):
+    return (np.asarray(SESSION.images[img_id]["G"]) @ np.array([*point, 1.]))[:2]
+
+
+def _point_visible(img_id, point):
+    p = _project_point(img_id, point)
+    h, w = get_full(img_id).shape[:2]
+    return bool(0 <= p[0] < w and 0 <= p[1] < h)
+
+
+@app.get("/api/anchors/{mid}")
+def get_anchors(mid: str):
+    with SESSION.lock:
+        st = _anchor_state(mid)
+        pairs = snapshot(st["pairs"])
+        for p in pairs:
+            p["requested_enabled"] = p.get("enabled", True)
+            p["enabled"] = p.get("enabled", True) and _point_visible(SESSION.fixed_id(), p["fixed"]) and _point_visible(mid, p["moving"])
+        return {"pairs": pairs, "revision": st["revision"], "fixed_id": SESSION.fixed_id()}
+
+
+@app.put("/api/anchors/{mid}")
+def put_anchors(mid: str, pairs: list[dict] = Body(embed=True), base_revision: int = Body(embed=True), fixed_id: str = Body(embed=True)):
+    with SESSION.lock:
+        _require_idle()
+        st = _anchor_state(mid)
+        if fixed_id != SESSION.fixed_id() or base_revision != st["revision"]:
+            raise HTTPException(409, "앵커 상태가 변경됐습니다. 다시 선택하세요")
+        ids = set()
+        for p in pairs:
+            if not isinstance(p.get("id"), str) or not p["id"] or p["id"] in ids:
+                raise HTTPException(422, "잘못된 앵커 ID")
+            ids.add(p["id"])
+            for side, iid in (("fixed", fixed_id), ("moving", mid)):
+                xy = p.get(side)
+                if not isinstance(xy, list) or len(xy) != 2:
+                    raise HTTPException(422, "잘못된 앵커 좌표")
+                try:
+                    xy = np.asarray(xy, dtype=float)
+                except (ValueError, TypeError):
+                    raise HTTPException(422, "잘못된 앵커 좌표")
+                im = SESSION.images[iid]
+                if not np.isfinite(xy).all() or not (0 <= xy[0] < im["source_w"] and 0 <= xy[1] < im["source_h"]):
+                    raise HTTPException(422, "앵커가 원본 사진 범위 밖입니다")
+        before = SESSION.snapshot()
+        st["pairs"] = [{"id": p["id"], "fixed": p["fixed"], "moving": p["moving"],
+                        "enabled": bool(p.get("requested_enabled", p.get("enabled", True)))} for p in pairs]
+        st["revision"] += 1
+        _record("앵커 변경", mid, before)
+        return get_anchors(mid)
+
+
+def _png_response(rgb):
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise HTTPException(500, "PNG 인코딩 실패")
+    return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/image/{img_id}/source")
+def image_source(img_id: str):
+    im = _require_image(img_id)
+    return _png_response(_load_rgb(im["source_path"]))
+
+
+def _region(img, x, y, width, height):
+    if width < 1 or height < 1 or width > 2048 or height > 2048:
+        raise HTTPException(422, "확대 영역 크기는 1~2048 픽셀입니다")
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = max(0, x), max(0, y), min(w, x + width), min(h, y + height)
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(422, "확대 영역이 사진 밖입니다")
+    return _png_response(img[y0:y1, x0:x1])
+
+
+@app.get("/api/image/{img_id}/region")
+def image_region(img_id: str, x: int = 0, y: int = 0, width: int = 512, height: int = 512):
+    _require_image(img_id)
+    return _region(get_full(img_id), x, y, width, height)
+
+
+@app.post("/api/image/{img_id}/edit")
+async def edit_image(img_id: str, image: UploadFile = File(...), metadata: str = Form(...)):
+    contents = await image.read()
+    try:
+        meta = json.loads(metadata)
+        G = np.asarray(meta["G"], dtype=float).reshape(3, 3)
+        from PIL import Image
+        decoded = Image.open(io.BytesIO(contents))
+        if decoded.format != "PNG":
+            raise ValueError("편집 이미지는 PNG여야 합니다")
+        rgb = np.array(decoded.convert("RGB"))
+        if not is_similarity(G, allow_reflection=True):
+            raise ValueError("사진 비율을 보존해야 합니다")
+        if rgb.shape[:2] != (meta["height"], meta["width"]):
+            raise ValueError("편집 크기가 일치하지 않습니다")
+        if not isinstance(meta["edits"], dict):
+            raise ValueError("잘못된 편집 정보")
+    except (ValueError, KeyError, TypeError, OSError) as e:
+        raise HTTPException(422, str(e))
+    with SESSION.lock:
+        _require_idle()
+        im = _require_image(img_id)
+        if meta.get("base_revision") != im["revision"]:
+            raise HTTPException(409, "사진이 변경됐습니다. 편집을 다시 여세요")
+        before = SESSION.snapshot()
+        st = _mask_state(img_id)
+        st["current"] = _freeze_mask(img_id, st["current"])
+        st["confirmed"] = [_freeze_mask(img_id, p) for p in st["confirmed"]]
+        old_h, old_w = get_full(img_id).shape[:2]
+        work_h, work_w = get_work(img_id).shape[:2]
+        source_from_work = np.linalg.inv(np.asarray(im["G"])) @ _pixel_scale(old_w / work_w, old_h / work_h)
+        source_points = [(source_from_work @ np.array([p["x"], p["y"], 1]), p["label"]) for p in st["points"]]
+        path = os.path.join(SESSION.dir, f"{img_id}-{uuid.uuid4().hex}.png")
+        Image.fromarray(rgb).save(path, format="PNG")
+        im.update(path=path, revision=SESSION.revision + 1, G=G.tolist(), edits=meta["edits"],
+                  full_w=rgb.shape[1], full_h=rgb.shape[0])
+        _invalidate_images()
+        nh, nw = get_work(img_id).shape[:2]
+        to_work = _pixel_scale(nw / rgb.shape[1], nh / rgb.shape[0]) @ G
+        st["points"] = []
+        for point, label in source_points:
+            p = to_work @ point
+            if 0 <= p[0] < nw and 0 <= p[1] < nh:
+                st["points"].append({"x": float(p[0]), "y": float(p[1]), "label": label})
+        st["rev"] += 1
+        _record("기준 사진 편집", img_id, before)
+        return {"ok": True, "image_id": img_id, "revision": im["revision"]}
+
 
 def _full_mask(img_id: str) -> np.ndarray:
     """마스크 미지정 시 전체영역 정합용 전면 마스크 (엔진 무수정 경로)."""
@@ -431,99 +691,147 @@ def _full_mask(img_id: str) -> np.ndarray:
     return np.full((h, w), 255, dtype=np.uint8)
 
 
+def _job_event(job, state, **fields):
+    publish("register", {"job_id": job["job_id"], "target_ids": job["target_ids"],
+                         "fixed_id": job["fixed_id"], "state": state,
+                         "done": job["done"], "total": job["total"], **fields})
+
+
 def _run_registration(lazy: bool, profile: str, movings: list[str]) -> None:
+    session = SESSION
+    job = session.job
+    fixed_id = job["fixed_id"]
     cfg = get_profile(profile)
-    fixed_id = SESSION.fixed_id()
     try:
         fixed_full = get_full(fixed_id)
         fmask_real = _union_mask(fixed_id)
-        total = len(movings)
-        for i, mid in enumerate(movings):
-            publish("register", {"state": "progress", "done": i, "total": total,
-                                 "name": SESSION.images[mid]["name"]})
-            m_full = get_full(mid)
-            mmask_real = _union_mask(mid)
-            # 페어 정책: 양쪽 다 마스크가 있을 때만 마스크 정합, 아니면 전체영역
-            used_mask = fmask_real is not None and mmask_real is not None
-            fmask = fmask_real if used_mask else _full_mask(fixed_id)
-            mmask = mmask_real if used_mask else _full_mask(mid)
-            pair_cfg = cfg  # affine 허용 여부는 프로필이 결정 (기본=similarity 전용)
-            fmask_full = cv2.resize(fmask, (fixed_full.shape[1], fixed_full.shape[0]),
-                                    interpolation=cv2.INTER_NEAREST)
-            mmask_full = cv2.resize(mmask, (m_full.shape[1], m_full.shape[0]),
-                                    interpolation=cv2.INTER_NEAREST)
-
-            def cb(cur, tot, label, _mid=mid, _i=i):
-                publish("register", {"state": "lazy", "done": _i, "total": total,
-                                     "lazy_cur": cur, "lazy_total": tot,
-                                     "lazy_label": label})
-
-            fn = register_test_lazy if lazy else register_test
-            kw = {"cfg": pair_cfg}
-            if lazy:
-                kw["progress_callback"] = cb
-            entry = fn(fixed_full, m_full, fmask_full, mmask_full, **kw)[0]
-            entry["used_mask"] = used_mask
-            prev = SESSION.results.get(mid)
-            if entry.get("status") == "fail" and prev and prev.get("status") != "fail":
-                # 재정합 실패 — 기존 정상 결과 보존 (Codex 확정)
-                publish("register", {"state": "one_done", "id": mid,
-                                     "summary": _result_summary(prev),
-                                     "kept": True,
-                                     "note": f"재정합 실패({entry.get('reason')}) — 기존 결과 유지"})
-            else:
-                SESSION.results[mid] = entry
-                publish("register", {"state": "one_done", "id": mid,
-                                     "summary": _result_summary(entry)})
-        publish("register", {"state": "done", "total": total})
+        for mid in movings:
+            with session.lock:
+                if job["stop_requested"]:
+                    break
+                job["items"][mid] = "running"
+                job["moving_id"] = mid
+            _job_event(job, "progress", moving_id=mid, name=session.images[mid]["name"])
+            used_mask = False
+            try:
+                m_full = get_full(mid)
+                mmask_real = _union_mask(mid)
+                used_mask = fmask_real is not None and mmask_real is not None
+                fmask = fmask_real if used_mask else _full_mask(fixed_id)
+                mmask = mmask_real if used_mask else _full_mask(mid)
+                fmask_full = cv2.resize(fmask, (fixed_full.shape[1], fixed_full.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mmask_full = cv2.resize(mmask, (m_full.shape[1], m_full.shape[0]), interpolation=cv2.INTER_NEAREST)
+                anchors = []
+                for pair in get_anchors(mid)["pairs"]:
+                    if pair.get("enabled", True):
+                        anchors.append(tuple(_project_point(fixed_id, pair["fixed"])) + tuple(_project_point(mid, pair["moving"])))
+                def cb(cur, total, label):
+                    _job_event(job, "lazy", moving_id=mid, lazy_cur=cur, lazy_total=total, lazy_label=label)
+                fn = register_test_lazy if lazy else register_test
+                kw = {"cfg": cfg, "anchor_points": anchors}
+                if lazy:
+                    kw["progress_callback"] = cb
+                entry = fn(fixed_full, m_full, fmask_full, mmask_full, **kw)[0]
+                if entry.get("M_full") is not None and not is_similarity(entry["M_full"]):
+                    raise ValueError("비율을 보존하지 않는 정합 결과를 거절했습니다")
+            except Exception as e:
+                log.exception("registration failed for %s", mid)
+                entry = {"status": "fail", "gate": "none", "reason": str(e), "metrics": {}}
+            with session.lock:
+                before = session.snapshot()
+                entry.update(id=uuid.uuid4().hex, moving_id=mid, fixed_id=fixed_id,
+                             fixed_revision=session.images[fixed_id]["revision"],
+                             moving_revision=session.images[mid]["revision"],
+                             fixed_mask_revision=session.masks.get(fixed_id, {}).get("rev", 0),
+                             moving_mask_revision=session.masks.get(mid, {}).get("rev", 0),
+                             anchor_revision=session.anchors.get((fixed_id, mid), {}).get("revision", 0),
+                             fixed_img=fixed_full, moving_path=session.images[mid]["path"],
+                             fixed_name=session.images[fixed_id]["name"], used_mask=used_mask,
+                             review_status="unreviewed", job_id=job["job_id"])
+                # Derive overlays on demand and retain the pinned source path, avoiding
+                # two additional full-resolution arrays per registered photo.
+                entry.pop("false_color", None)
+                results = session.result_pairs.setdefault(fixed_id, {})
+                prev = results.get(mid)
+                failed = entry.get("status") == "fail"
+                kept = bool(failed and prev and prev.get("registered_img") is not None)
+                if kept:
+                    prev = snapshot(prev)
+                    prev.update(latest_attempt_failed=True, latest_attempt_reason=entry.get("reason") or "품질 기준 미달")
+                    results[mid] = prev
+                else:
+                    entry.update(latest_attempt_failed=failed, latest_attempt_reason=entry.get("reason") if failed else None)
+                    if prev and prev.get("registered_img") is not None:
+                        entry["previous"] = {k: v for k, v in snapshot(prev).items() if k != "previous"}
+                    results[mid] = entry
+                job["done"] += 1
+                job["items"][mid] = "failed" if failed else "done"
+                session.record("정합 재시도" if kept else "정합 결과", mid, before)
+                _job_event(job, "one_done", id=mid, moving_id=mid, summary=_result_summary(results[mid]), kept=kept)
     except Exception as e:
-        log.exception("registration failed")
-        publish("register", {"state": "error", "detail": str(e)})
+        log.exception("registration job failed")
+        job["error"] = str(e)
+        _job_event(job, "error", detail=str(e))
     finally:
-        SESSION.running = False
+        with session.lock:
+            for mid in movings:
+                if job["items"][mid] == "queued":
+                    job["items"][mid] = "cancelled"
+            job["cancelled"] = any(v == "cancelled" for v in job["items"].values())
+            job["state"] = "done"
+            session.running = False
+            if session.pending_fixed:
+                before = session.snapshot()
+                session.set_fixed(session.pending_fixed)
+                session.record("기준 사진 변경", session.pending_fixed, before)
+                session.pending_fixed = None
+            _job_event(job, "done", cancelled=job["cancelled"], items=job["items"])
 
 
 @app.post("/api/register")
 def run_register(lazy: bool = Body(default=False, embed=True),
                  profile: str = Body(default="normal", embed=True),
                  only: list[str] | None = Body(default=None, embed=True)) -> dict:
-    """전체 정합(only=None: 모든 Moving) / 선택 정합(only=[id,...]).
-
-    마스크는 선택 사항 — 페어(기준+해당 Moving) 양쪽에 있을 때만 마스크 정합,
-    아니면 전체영역 정합으로 진행.
-    """
-    if SESSION.running:
-        raise HTTPException(409, "이미 실행 중")
-    fixed_id = SESSION.fixed_id()
-    if not fixed_id:
-        raise HTTPException(409, "Fixed 이미지가 필요합니다")
-    all_movings = SESSION.moving_ids()
-    if only is not None:
-        movings = [m for m in all_movings if m in set(only)]
+    with SESSION.lock:
+        _require_idle()
+        if profile not in PROFILES:
+            raise HTTPException(422, "지원하는 프로필은 기본/엄격입니다")
+        if not SESSION.fixed_id():
+            raise HTTPException(409, "기준 사진을 추가하세요")
+        movings = [m for m in SESSION.moving_ids() if only is None or m in set(only)]
         if not movings:
-            raise HTTPException(422, "선택된 Moving 이미지가 없습니다")
-    else:
-        movings = all_movings
-        if not movings:
-            raise HTTPException(409, "Moving 이미지가 없습니다")
-    SESSION.running = True
-    threading.Thread(target=_run_registration, args=(lazy, profile, movings),
-                     daemon=True).start()
-    return {"started": True, "count": len(movings)}
+            raise HTTPException(422, "비교할 사진을 선택하세요")
+        job_id = uuid.uuid4().hex
+        SESSION.job = {"job_id": job_id, "target_ids": movings.copy(), "fixed_id": SESSION.fixed_id(),
+                       "done": 0, "total": len(movings), "state": "running", "stop_requested": False,
+                       "cancelled": False, "items": {m: "queued" for m in movings}}
+        SESSION.running = True
+        threading.Thread(target=_run_registration, args=(lazy, profile, movings), daemon=True).start()
+        return {"started": True, "count": len(movings), "job_id": job_id, "target_ids": movings}
 
 
-def _result_image(mid: str, kind: str) -> np.ndarray:
+@app.post("/api/register/stop")
+def stop_registration():
+    with SESSION.lock:
+        if SESSION.running:
+            SESSION.job["stop_requested"] = True
+        return {"ok": True, "job_id": (SESSION.job or {}).get("job_id")}
+
+
+def _result_image(mid: str, kind: str, previous=False) -> np.ndarray:
     r = SESSION.results.get(mid)
+    if previous and r:
+        r = r.get("previous")
     if not r:
         raise HTTPException(404, "결과 없음")
     if kind == "registered":
         img = r.get("registered_img")
     elif kind == "false_color":
-        img = r.get("false_color")
+        img = false_color(r["fixed_img"], r["registered_img"]) if r.get("registered_img") is not None else None
     elif kind == "match_viz":
         img = r.get("match_viz")
     elif kind == "fixed":
-        img = get_full(SESSION.fixed_id())
+        img = r.get("fixed_img")
     else:
         raise HTTPException(400)
     if img is None:
@@ -610,9 +918,10 @@ def select_folder() -> dict:
 
 def _encode_result_jpg(mid: str) -> tuple[str, bytes]:
     """(파일명, JPEG 바이트) — 개별 다운로드와 동일 규칙."""
-    img = _result_image(mid, "registered")
-    fixed_name = os.path.splitext(SESSION.images[SESSION.fixed_id()]["name"])[0]
-    mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
+    with SESSION.lock:
+        img = _result_image(mid, "registered")
+        fixed_name = os.path.splitext(SESSION.results[mid]["fixed_name"])[0]
+        mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                            [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
@@ -622,49 +931,89 @@ def _encode_result_jpg(mid: str) -> tuple[str, bytes]:
 
 @app.post("/api/save_results")
 def save_results(dir: str = Body(embed=True),
-                 only: list[str] | None = Body(default=None, embed=True)) -> dict:
+                 only: list[str] | None = Body(default=None, embed=True),
+                 expected_fixed_id: str | None = Body(default=None, embed=True),
+                 expected_results: dict[str, str] | None = Body(default=None, embed=True)) -> dict:
     """정합 결과 일괄 저장 — 전체(only=None) 또는 선택(only=[id,...])."""
-    if not os.path.isdir(dir):
-        raise HTTPException(400, f"폴더가 없습니다: {dir}")
-    targets = [m for m in SESSION.moving_ids()
-               if (only is None or m in set(only)) and SESSION.results.get(m)]
-    if not targets:
-        raise HTTPException(409, "저장할 정합 결과가 없습니다")
-    saved, failed = [], []
-    for mid in targets:
-        try:
-            name, data = _encode_result_jpg(mid)
-            with open(os.path.join(dir, name), "wb") as f:
-                f.write(data)
-            saved.append(name)
-        except Exception:
-            log.exception("save failed: %s", mid)
-            failed.append(SESSION.images[mid]["name"])
-    return {"saved": len(saved), "failed": failed, "dir": dir}
+    with SESSION.lock:
+        if expected_fixed_id is not None and expected_fixed_id != SESSION.fixed_id():
+            raise HTTPException(409, "저장 폴더를 선택하는 동안 기준이 바뀌었습니다. 저장할 결과를 다시 선택해 주세요.")
+        if expected_results is not None and any(SESSION.results.get(mid, {}).get("id") != rid for mid, rid in expected_results.items()):
+            raise HTTPException(409, "저장 폴더를 선택하는 동안 결과가 바뀌었습니다. 저장할 결과를 다시 선택해 주세요.")
+        if not os.path.isdir(dir):
+            raise HTTPException(400, f"폴더가 없습니다: {dir}")
+        targets = [m for m in SESSION.moving_ids()
+                   if (only is None or m in set(only)) and SESSION.results.get(m)]
+        if not targets:
+            raise HTTPException(409, "저장할 정합 결과가 없습니다")
+        saved, failed = [], []
+        for mid in targets:
+            try:
+                name, data = _encode_result_jpg(mid)
+                with open(os.path.join(dir, name), "wb") as f:
+                    f.write(data)
+                saved.append(name)
+            except Exception:
+                log.exception("save failed: %s", mid)
+                failed.append(SESSION.images[mid]["name"])
+        return {"saved": len(saved), "failed": failed, "dir": dir}
 
 
 @app.get("/api/result/{mid}/download")
 def result_download(mid: str):
-    img = _result_image(mid, "registered")
-    fixed_name = os.path.splitext(
-        SESSION.images[SESSION.fixed_id()]["name"])[0]
-    mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
-    out = os.path.join(SESSION.dir, f"{fixed_name}_R_{mov_name}.jpg")
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                           [cv2.IMWRITE_JPEG_QUALITY, 95])
+    name, data = _encode_result_jpg(mid)
+    out = os.path.join(SESSION.dir, uuid.uuid4().hex + ".jpg")
     with open(out, "wb") as f:
-        f.write(buf.tobytes())
-    return FileResponse(out, filename=os.path.basename(out),
-                        media_type="image/jpeg")
+        f.write(data)
+    return FileResponse(out, filename=name, media_type="image/jpeg")
+
+
+@app.get("/api/result/{mid}/region")
+def result_region(mid: str, kind: str = "registered", x: int = 0, y: int = 0, width: int = 512, height: int = 512):
+    if kind not in ("fixed", "registered"):
+        raise HTTPException(422, "지원하지 않는 확대 이미지")
+    return _region(_result_image(mid, kind), x, y, width, height)
+
+
+@app.get("/api/result/{mid}/previous/region")
+def previous_region(mid: str, kind: str = "registered", x: int = 0, y: int = 0, width: int = 512, height: int = 512):
+    if kind not in ("fixed", "registered"):
+        raise HTTPException(422, "지원하지 않는 확대 이미지")
+    return _region(_result_image(mid, kind, previous=True), x, y, width, height)
+
+
+@app.get("/api/result/{mid}/previous/{kind}")
+def previous_result_image(mid: str, kind: str, max_side: int = 1600):
+    return _preview_response(_result_image(mid, kind, previous=True), max_side)
+
+
+@app.post("/api/result/{mid}/review")
+def review_result(mid: str, result_id: str = Body(embed=True), status: str = Body(embed=True)):
+    with SESSION.lock:
+        r = SESSION.results.get(mid)
+        if not r or r.get("id") != result_id:
+            raise HTTPException(409, "결과가 변경됐습니다. 현재 결과를 다시 확인하세요")
+        if status not in ("unreviewed", "confirmed", "needs_work"):
+            raise HTTPException(422, "지원하지 않는 검토 상태")
+        if status == "confirmed" and (_freshness(r) != "current" or r.get("registered_img") is None):
+            raise HTTPException(409, "현재 입력으로 정합한 뒤 확인하세요")
+        before = SESSION.snapshot()
+        r["review_status"] = status
+        _record("결과 검토 상태 변경", mid, before)
+        return {"ok": True, "result": _result_summary(r)}
 
 
 @app.get("/api/result/{mid}/{kind}")
 def result_image(mid: str, kind: str, max_side: int = 1600):
-    img = _result_image(mid, kind)
+    return _preview_response(_result_image(mid, kind), max_side)
+
+
+def _preview_response(img, max_side):
     h, w = img.shape[:2]
+    max_side = max(1, min(max_side, 4096))
     s = max_side / max(h, w)
     if s < 1:
-        img = cv2.resize(img, (int(w * s), int(h * s)),
+        img = cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))),
                          interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                            [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -678,40 +1027,47 @@ def adjust_result(mid: str,
                   scale: float = Body(default=1.0, embed=True),
                   rot_deg: float = Body(default=0.0, embed=True),
                   ref_w: float = Body(default=0.0, embed=True),
+                  result_id: str | None = Body(default=None, embed=True),
                   reset: bool = Body(default=False, embed=True)) -> dict:
-    """수동 미세조정: fixed 중심 기준 delta similarity를 정합행렬에 합성.
-
-    dx/dy는 ref_w 폭 기준 픽셀 (ref_w=0이면 fixed 원본 픽셀).
-    rot_deg는 화면 기준 시계방향 +. reset=True면 자동 정합 행렬로 복원.
-    """
-    if SESSION.running:
-        raise HTTPException(409, "정합 실행 중")
-    r = SESSION.results.get(mid)
-    if not r or r.get("M_full") is None:
-        raise HTTPException(404, "결과 없음")
-    if "M_orig" not in r:
-        r["M_orig"] = np.array(r["M_full"], dtype=np.float64).copy()
-    fixed = get_full(SESSION.fixed_id())
-    h, w = fixed.shape[:2]
-    if reset:
-        new_M = r["M_orig"].copy()
-    else:
-        sc = w / ref_w if ref_w else 1.0
-        D = np.eye(3, dtype=np.float64)
-        # getRotationMatrix2D의 +각은 화면상 반시계 → 화면 시계방향 + 규약이라 부호 반전
-        D[:2] = cv2.getRotationMatrix2D((w / 2, h / 2), -rot_deg, scale)
-        D[0, 2] += dx * sc
-        D[1, 2] += dy * sc
-        new_M = D @ np.array(r["M_full"], dtype=np.float64)
-    flip, k = r.get("lazy_orientation", (False, 0))
-    m_src = _apply_orientation(get_full(mid), flip, k)
-    reg = cv2.warpAffine(m_src, new_M[:2, :], (w, h))
-    r["M_full"] = new_M
-    r["registered_img"] = reg
-    r["false_color"] = false_color(fixed, reg)
-    r["manual_adjusted"] = not np.allclose(new_M, r["M_orig"])
-    return {"ok": True, "manual_adjusted": r["manual_adjusted"],
-            "ts": time.time_ns()}
+    with SESSION.lock:
+        _require_idle()
+        r = SESSION.results.get(mid)
+        if not r or r.get("M_full") is None:
+            raise HTTPException(404, "결과 없음")
+        if result_id is not None and result_id != r.get("id"):
+            raise HTTPException(409, "정합 결과가 변경됐습니다. 현재 결과에서 다시 조정하세요")
+        if not np.isfinite([dx, dy, scale, rot_deg, ref_w]).all() or scale <= 0 or ref_w < 0:
+            raise HTTPException(422, "유효한 등방 배율과 이동값을 입력하세요")
+        before = SESSION.snapshot()
+        r = snapshot(r)
+        r["previous"] = {k: v for k, v in snapshot(r).items() if k != "previous"}
+        if "M_orig" not in r:
+            r["M_orig"] = np.array(r["M_full"], dtype=np.float64).copy()
+        fixed = r["fixed_img"]
+        h, w = fixed.shape[:2]
+        if reset:
+            new_M = r["M_orig"].copy()
+        else:
+            sc = w / ref_w if ref_w else 1.0
+            D = np.eye(3, dtype=np.float64)
+            D[:2] = cv2.getRotationMatrix2D((w / 2, h / 2), -rot_deg, scale)
+            D[0, 2] += dx * sc
+            D[1, 2] += dy * sc
+            new_M = D @ np.array(r["M_full"], dtype=np.float64)
+        if not is_similarity(new_M):
+            raise HTTPException(422, "사진 비율을 보존해야 합니다")
+        flip, k = r.get("lazy_orientation", (False, 0))
+        m_src = _apply_orientation(_load_rgb(r["moving_path"]), flip, k)
+        reg = cv2.warpAffine(m_src, new_M[:2, :], (w, h))
+        r.update(M_full=new_M, registered_img=reg,
+                 manual_adjusted=not np.allclose(new_M, r["M_orig"]),
+                 id=uuid.uuid4().hex, review_status="unreviewed")
+        # Automatic match metrics no longer describe a manual transform.
+        r["metrics"] = {"scale": float(np.sqrt(np.linalg.det(new_M[:2, :2]))),
+                        "rotation_deg": float(np.degrees(np.arctan2(new_M[1, 0], new_M[0, 0])))}
+        SESSION.results[mid] = r
+        _record("정합 미세조정", mid, before)
+        return {"ok": True, "manual_adjusted": r["manual_adjusted"], "result_id": r["id"], "ts": time.time_ns()}
 
 
 @app.get("/api/events")

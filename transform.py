@@ -11,6 +11,21 @@ import numpy as np
 from config import DEFAULT, AffineGate, SimilarityGate
 
 
+def is_similarity(matrix, *, allow_reflection=False) -> bool:
+    """Check uniform scale + orthogonal axes; reject shear, singular/nonfinite maps."""
+    M = np.asarray(matrix, dtype=np.float64)
+    if M.shape not in ((2, 3), (3, 3)) or not np.isfinite(M).all():
+        return False
+    if M.shape == (3, 3) and not np.allclose(M[2], [0, 0, 1], atol=1e-8):
+        return False
+    A = M[:2, :2]
+    gram = A.T @ A
+    scale2 = float(np.trace(gram) / 2)
+    return bool(scale2 > 1e-12 and
+                (allow_reflection or np.linalg.det(A) > 0) and
+                np.allclose(gram, np.eye(2) * scale2, rtol=1e-6, atol=1e-8))
+
+
 def compose_full_matrix(M_loftr_2x3: np.ndarray,
                          M_rot_f: np.ndarray,
                          crop_offset_f: tuple,
@@ -56,7 +71,8 @@ def compose_full_matrix(M_loftr_2x3: np.ndarray,
 
     # 합성
     M_full = np.linalg.inv(A_f) @ to_3x3(M_loftr_2x3) @ A_m
-
+    if not is_similarity(M_full):
+        raise np.linalg.LinAlgError("비율을 보존하지 않는 변환")
     return M_full
 
 
@@ -129,7 +145,7 @@ def quality_gate_similarity(
         return 'fail', metrics
 
     hard_fail = (
-        det <= 0 or
+        not is_similarity(M_2x3) or det <= 0 or
         reproj_median >= cfg.reproj_median_fail or
         reproj_p90 >= cfg.reproj_p90_fail or
         scale < cfg.scale_fail[0] or scale > cfg.scale_fail[1] or

@@ -1,135 +1,94 @@
-# DKPregistrator
+# DKP Registrator
 
-치과 임상 사진 정합(Registration) 도구. LoFTR 특징 매칭 + SAM2 마스크 기반 파이프라인.
+치과 임상사진을 같은 기준으로 맞추고 비교하는 로컬 작업대입니다. LoFTR 정합과 선택적인 SAM2 마스크를 사용하며, 원본 사진을 유지합니다.
 
-## 사용 방법
+## 실행파일
 
-### 1. 이미지 선택
-- **Fixed**: 기준 이미지 (Browse로 선택)
-- **Moving1~11**: 정합할 이미지 (Browse로 선택)
-  - **+ Moving**: 이동상 슬롯 추가 (최대 11개)
-  - **- Moving**: 마지막 슬롯 제거
+[GitHub Releases](https://github.com/perioahn/dkp_registrator/releases)에서 다운로드합니다.
 
-### 2. SAM2 마스크 선택
-- **Select Masks (SAM2)** 버튼 클릭
-- Fixed + 모든 Moving 이미지가 그리드로 표시됨
-- 각 이미지에서 치아 영역을 클릭하여 마스크 지정
-  - **좌클릭**: 포함 영역 선택
-  - **우클릭**: 제외 영역 선택
-  - **Z**: 현재 개체 확정 → 다음 개체
-  - **X**: 현재 이미지 리셋
-  - **C**: 전체 완료
-  - **Q**: 취소
-  - **A**: 앵커 포인트 설정 (Fixed 1점 + 각 Moving 1점씩 = 1세트)
-  - **D**: 앵커 초기화
+- **Windows x64:** `DKPregistrator-Windows-x64.zip`을 모두 압축 해제하고 `DKPregistrator.exe` 실행. `_internal` 폴더도 함께 있어야 합니다.
+- **macOS Apple Silicon:** `DKPregistrator-macOS-arm64.zip`을 풀고 `.app` 실행. 개발자 인증·공증을 받은 배포판은 아닙니다. macOS가 차단하면 시스템 설정의 개인정보 보호 및 보안에서 해당 앱의 열기를 허용해야 할 수 있습니다.
+- 실행하면 기본 브라우저에 작업대가 열립니다. Python을 별도로 설치할 필요가 없습니다.
+- 정합·마스크 모델은 처음 사용할 때 내려받으므로 첫 사용에는 인터넷이 필요합니다. 사진 편집과 정합은 이 컴퓨터에서 처리합니다.
 
-### 3. Register (정합 실행)
-- **Register** 버튼 클릭
-- 3단계 피라미드 정합 (320→480→640) 자동 실행
-- 저해상도에서 coarse 정합 → 고해상도로 전파하여 정밀도 향상
-- **Lazy Mode** 체크박스 (선택): 좌우반전 + 0/90/180/270° 회전 8가지 조합 중
-  최적을 자동 선택. 저해상 프리스크리닝으로 8조합을 순위화한 뒤 상위 1~2개만
-  풀 정합을 실행하므로 일반 모드 대비 약간만 느림. 진행 바로 현재 시도 표시.
+## 사진 추가 → 정합 → 검토
 
-### 4. 결과 확인 및 저장
-- 정합 완료 시 결과 창 자동 표시 (정합 이미지 + false color)
-- **Save**: 결과 창 다시 열기 (개별 Save / Save All)
-- **Matches**: 키포인트 매칭 시각화 (녹색=inlier, 빨간=outlier)
-- 기본 파일명: `Fixed이름_R_Moving이름.jpg`
+1. **사진 추가**에서 JPEG/PNG 여러 장을 선택하거나 끌어 놓습니다. 실제로 불러온 첫 사진이 기준이며, 추가 업로드는 기존 기준을 유지합니다.
+2. 다른 사진을 클릭하면 기준과 나란히 표시됩니다. 마스크 없이 **현재 정합**, **선택 N장 정합**, **전체 정합**을 실행할 수 있습니다.
+3. 기준을 바꾸려면 사진을 선택하고 **이 사진을 기준으로 지정**을 누릅니다. 기존 기준은 일반 사진이 되며 원본·편집·마스크와 기준별 대응점·결과를 보존합니다. 실행 중 변경은 현재 사진을 마친 뒤 적용됩니다.
+4. **나란히 / 와이프 / 색상 겹침 / 깜빡임 / 매칭점**으로 비교합니다. 휠은 포인터 중심 확대, Space+드래그는 화면 이동입니다. **100% / 부분 확대**는 원본 해상도 영역을 사용합니다.
+5. **확인하고 다음**으로 목록을 검토합니다. 자동 평가와 사용자의 확인 상태를 구분합니다. 입력이 바뀌면 이전 확인을 최신 결과에 이어 붙이지 않습니다.
+6. **정보·저장**에서 현재·선택·확인한 결과·이번 작업·전체 결과를 저장합니다. 이름은 `기준이름_R_사진이름.jpg`입니다. 작업 목록 제거는 원본 파일 삭제가 아닙니다.
 
-## 웹 UI (신규)
+목록의 강조 테두리는 **현재 사진**, 체크박스는 **일괄 처리 대상**, 기준 배지는 **정합 기준**입니다. 정합 후 체크를 유지합니다. 처리 중 다른 사진을 보고 있으면 완료 후에도 그 사진을 유지하며, **최근 결과 보기**로 돌아갈 수 있습니다.
 
-브라우저 기반 UI — tkinter GUI와 동일한 엔진을 사용합니다.
+아래 필름스트립은 왼쪽 목록으로 바꿀 수 있습니다. 파일명 검색과 미정합·검토 필요·실패·확인됨 필터, 정보 패널 접기를 지원합니다. **남은 작업 중지**는 현재 계산을 마친 뒤 나머지를 중지합니다.
 
-```bash
-python webapp/server.py        # http://127.0.0.1:8790 자동 오픈
-```
+## 보정 도구와 단축키
 
-1. 기준(Fixed) 1장 + Moving 여러 장 업로드
-2. 각 이미지에서 치아 **좌클릭=포함 / 우클릭=제외**, [개체 확정(Z)]으로 다음 개체
-3. ▶ Register (Lazy 토글, normal/strict/relaxed 프로필 선택 가능)
-4. 결과: 품질 배지(PASS/WARN/FAIL+사유) + 와이프 슬라이더 / False color /
-   플리커 / 나란히 / 매칭점 보기, 휠 줌·드래그 팬, 💾 저장
+단축키는 작업대에 포커스가 있을 때 작동합니다. 입력칸·한글 조합 중에는 개입하지 않으며 모든 동작을 버튼으로도 제공합니다.
 
-## 설치 A — 실행파일 (Python 불필요)
+| 키 | 동작 |
+|---|---|
+| Z | 현재 마스크 개체 확정 |
+| X | 현재 대상 사진의 마스크 초기화, 취소 가능 |
+| A | 기준점 → 현재 사진 대응점 순서로 입력 |
+| D | 입력 중인 점 취소 또는 선택한 대응점쌍 제거 |
+| Ctrl/Cmd+Z | 최근 변경 취소 |
+| Ctrl/Cmd+Shift+Z | 다시 실행 |
+| Esc | 진행 중 도구 취소 |
+| 0 | 화면 맞춤 |
+| Space+드래그 | 화면 이동 |
+| ← / → | 이전 / 다음 사진 |
 
-[Releases](../../releases)에서 받기:
-- Windows: `DKPregistrator-Windows.zip` 압축 해제 → `DKPregistrator.exe` 실행
-- macOS: `DKPregistrator-macOS.zip` 압축 해제 → 앱 실행 (서명 안 된 앱이라 첫 실행은 우클릭 → 열기)
+**C는 배정하지 않습니다.** 마스크는 좌클릭 포함, 우클릭 제외입니다. 기준/현재 사진 중 마스크 대상을 선택할 수 있습니다. 대응점은 번호를 선택하거나 드래그해서 수정하며, 크롭 영역 밖의 점은 보존하되 정합에서 제외합니다. 대응점은 자동 정합의 가중 보조 입력이며 정확한 고정 제약이나 단독 정합을 보장하지 않습니다.
 
-## 설치 B — 소스 실행 (Python 3.10+ 설치된 PC)
+**기준 편집**은 [Photo Editor](https://github.com/perioahn/photo-editor)의 로컬 편집 기능을 통합했습니다. 90도/미세 회전, 좌우·상하 반전, 수평선, 밝기·대비, 자유·고정·사용자 비율 크롭과 격자, 원본 비교를 제공합니다. `/`는 구도를 유지하며 보정 전 톤을 비교합니다. 편집본은 원본에서 풀해상도 PNG로 만들어 즉시 기준에 반영하며, 중간 JPEG 재저장을 하지 않습니다. 적용/취소와 제스처 단위 되돌리기를 지원합니다.
 
-cmd(명령 프롬프트)에서 순서대로:
+기준 편집 전 결과는 계산 당시 기준으로 표시하며 다시 정합할 때까지 구분합니다. 재정합 실패 시 이전 성공 결과를 유지하면서 **이번 실패**를 표시합니다. 이전 정합 결과 비교와 미세조정 임시값 보존을 지원합니다.
 
-```bat
-git clone https://github.com/perioahn/dkp_registrator
-cd dkp_registrator
-pip install -r requirements.txt
+## 비율 보존
+
+출력 변환은 회전·이동·**균일 배율**만 허용합니다. 방향 탐색은 회전·반전을 사용할 수 있습니다. `relaxed`는 제거했고 API에서도 거절합니다. 전단·축별 다른 배율의 행렬은 일반/폴백/대응점/수동조정/저장 경로에서 허용하지 않습니다. 크롭은 영역만 자릅니다.
+
+기본/엄격 판정은 접힌 **정합 설정**에 있습니다. 맞지 않는 사진은 대응점·마스크·방향 자동탐색을 조정하여 다시 시도할 수 있습니다. 자동 지표와 시각적 검토를 함께 사용하세요.
+
+## GPU와 소스 실행
+
+CPU로 실행할 수 있습니다. Windows 배포판은 CPU PyTorch를 포함하며, NVIDIA GPU가 감지되면 설정에서 GPU 가속 파일을 선택 설치할 수 있습니다. 설치 후 재시작해야 합니다. Apple Silicon은 지원되는 연산에 Metal(MPS)을 사용합니다.
+
+```powershell
+python -m pip install -r requirements.txt
 python launcher.py
 ```
 
-git 없으면 초록 **Code → Download ZIP** 받아 압축 해제 후 그 폴더에서 `pip install ...`부터.
-`requirements.txt` 내용물 (개별 설치 시):
+검증 환경은 Windows Python 3.13이며, 배포 빌드는 Python 3.11을 사용합니다. `python launcher.py --tk`는 이전 Tk 인터페이스입니다. 이 README의 새 작업대·단축키 설명은 기본 웹 인터페이스 기준입니다.
 
-```bat
-pip install torch torchvision kornia opencv-python-headless numpy Pillow matplotlib scikit-image sam2 huggingface_hub fastapi uvicorn python-multipart
+세션은 현재 서버 실행 동안 유지됩니다. 서버 재시작 복구는 아직 제공하지 않습니다. 기존 세션 폴더를 시작할 때 지우지 않으며, 테스트는 `DKP_SESSION_ROOT` 또는 주입한 임시 경로로 격리합니다.
+
+## 개발과 검증
+
+```powershell
+python -m pytest tests/test_engine.py tests/test_workspace_api.py tests/test_similarity_only.py -q
+cd webapp/frontend
+npm ci
+npm run verify
+npx playwright install chromium
+npm run test:e2e
 ```
 
-- SAM2 모델 가중치(`sam2-hiera-tiny`)는 첫 실행 때 HuggingFace에서 자동 다운로드
-- 실행하면 브라우저에 웹 UI가 열림 (`python launcher.py --tk` = 구형 tkinter GUI)
+브라우저 통합 테스트는 별도 서버와 합성 사진/결정적 추론 경계를 사용합니다. 실제 LoFTR 검증은 Python 엔진 테스트에서 실행합니다. 임상사진 정확도 검증을 대신하지 않습니다.
 
-## 정합 모델 — 비율 보존
+태그 `v*` 푸시 또는 **Build App** 수동 실행은 두 운영체제에서 현재 프런트엔드를 다시 빌드하고, 실제 패키지의 서버 시작·사진 업로드·원본 읽기를 확인한 뒤 ZIP을 생성합니다. 태그 빌드는 Releases에 첨부됩니다.
 
-같은 악궁을 다른 날 찍은 사진의 실제 관계는 **similarity**(회전 + 균일 배율 + 평행이동)입니다.
-그래서 `normal`·`strict` 프로필은 similarity만 사용해 **가로세로 비율이 절대 왜곡되지 않습니다.**
-매칭이 부족하면 넓은 inlier 집합으로 similarity를 재적합해 구제하고, 그래도 안 되면 FAIL로 알립니다.
+## 변경 흐름
 
-`relaxed` 프로필만 최후 수단으로 affine(전단·비등방 배율)을 허용하며, 이 경우 결과 화면에
-**⚠ affine (비율 왜곡 가능)** 배지가 표시됩니다.
-
-## GPU 가속
-
-**GPU가 없어도 동작합니다.** GPU가 있으면 큰 폭으로 빨라집니다 (실측, RTX 4080 기준):
-
-| 항목 | 속도 향상 |
+| 시기 | 주요 기능 |
 |---|---|
-| LoFTR 매칭 | **×16** |
-| SAM2 마스크 클릭 반응 | **×3.7** |
-| 정합 전체 체감 | **약 10배** |
+| 2026년 4월 | Tk 마스크·점 앵커, 피라미드 정합 |
+| 2026년 5월 | 방향 자동탐색(Lazy) |
+| 2026년 7월 | 웹 화면, 결과 비교와 수동 미세조정 |
+| 2026년 8월 | 마스크 없는 배치 정합, 기준 미니맵, GPU 선택 설치 |
+| 이번 개편 | 통합 사진 목록·기준 변경, 웹 대응점·편집 이력, 기준 편집 통합, 비율 보존 강제, 연속 검토·원본 확대 |
 
-### Windows 실행파일
-
-실행파일에는 CPU용 PyTorch가 들어 있어 **어떤 PC에서도 받자마자 바로 실행**됩니다.
-NVIDIA GPU가 있으면 왼쪽 아래 **[⚡ GPU 가속 켜기]** 버튼이 나타나며, 누르면
-GPU용 PyTorch를 내려받아 설치합니다.
-
-- 다운로드 약 2.5GB (최초 1회 · 인터넷 필요) — 설치 중에도 앱은 계속 사용 가능
-- 설치가 끝나고 **앱을 다시 시작하면** GPU 가속이 적용됩니다
-- 설치에 실패해도 앱은 CPU로 그대로 동작합니다 (로그: `%LOCALAPPDATA%\DKPRegistrator\gpu_setup.log`)
-- CUDA 툴킷 설치는 불필요 — **NVIDIA 드라이버만 최신이면** 동작 (cu124 기준 525 이상)
-- GPU 메모리 부족(OOM) 시 해당 작업만 CPU로 자동 폴백 — 중단 없음
-- 되돌리려면 `%LOCALAPPDATA%\DKPRegistrator\cuda` 폴더를 삭제하면 CPU로 복귀
-
-### macOS
-
-Apple Silicon이면 **MPS(Metal) 가속이 자동 적용**됩니다 — 추가 설치 없음.
-(일부 미지원 연산은 CPU로 자동 폴백)
-
-### 소스 실행
-
-CUDA 빌드 PyTorch가 설치돼 있으면 자동으로 GPU를 사용합니다:
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-```
-
-기본 `pip install torch`(CPU 전용 빌드)로도 기능상 문제는 없습니다.
-다른 CUDA 계열 휠은 [pytorch.org](https://pytorch.org/get-started/locally/) 안내를 따르세요.
-
-## 실행
-
-```bash
-python main_gui.py
-```
-
-또는 [Releases](https://github.com/perioahn/dkp_registrator/releases)에서 빌드된 실행 파일(Windows/macOS)을 다운로드.
+설계 근거와 공식 제품 문서는 [UX 개정안](docs/plans/2026-09-06-photo-tool-ux-addendum.md), 편집 기능 출처는 [통합 기록](docs/photo-editor-integration.md)에 정리했습니다.

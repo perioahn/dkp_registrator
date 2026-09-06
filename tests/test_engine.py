@@ -28,10 +28,11 @@ from transform import quality_gate_similarity
 def test_profiles():
     assert get_profile("strict").sim_gate.min_inlier_fail > \
         DEFAULT.sim_gate.min_inlier_fail
-    assert get_profile("relaxed").sim_gate.rotation_fail_deg > \
-        DEFAULT.sim_gate.rotation_fail_deg
-    assert get_profile("없는이름") is DEFAULT
-    assert set(PROFILES) == {"normal", "strict", "relaxed"}
+    with pytest.raises(ValueError):
+        get_profile("relaxed")
+    with pytest.raises(ValueError):
+        get_profile("없는이름")
+    assert set(PROFILES) == {"normal", "strict"}
 
 
 def _perfect_match_set(n=60, rot_deg=5.0):
@@ -51,12 +52,9 @@ def test_gate_profiles_change_verdict():
     hull = cv2.contourArea(cv2.convexHull(kf))
     area = hull / 0.5  # coverage 0.5
     s_normal, _ = quality_gate_similarity(kf, km, M, inl, area)
-    s_relaxed, _ = quality_gate_similarity(kf, km, M, inl, area,
-                                           cfg=get_profile("relaxed").sim_gate)
     s_strict, _ = quality_gate_similarity(kf, km, M, inl, area,
                                           cfg=get_profile("strict").sim_gate)
     assert s_normal == 'warn'      # 회전 17° = normal warn 구간
-    assert s_relaxed == 'pass'     # relaxed는 25°까지 허용
     assert s_strict == 'fail'      # strict는 15° 초과 시 fail
 
 
@@ -168,6 +166,6 @@ def test_register_pair_wrapper():
     mask = np.full(fixed.shape[:2], 255, dtype=np.uint8)
     r = register_pair(fixed, moving, mask, mask, refine=True, hint=(0.2, 640))
     assert set(r) == {'registered_img', 'M_full', 'metrics', 'path', 'debug_images'}
-    assert r['path'] in ('similarity', 'affine')
+    assert r['path'] == 'similarity'
     assert r['metrics']['status'] in ('pass', 'warn')
     assert r['registered_img'] is not None

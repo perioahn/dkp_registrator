@@ -1,13 +1,10 @@
 name: Build App
-
 on:
-  workflow_dispatch:  # 수동 실행
+  workflow_dispatch:
   push:
-    tags: ["v*"]
-
+    tags: ['v*']
 permissions:
-  contents: write  # 태그 릴리스 자동 첨부
-
+  contents: write
 jobs:
   build:
     strategy:
@@ -15,94 +12,54 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            name: macOS
+            name: macOS-arm64
           - os: windows-latest
-            name: Windows
-
+            name: Windows-x64
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webapp/frontend/package-lock.json
+      - name: Verify and build current frontend
+        working-directory: webapp/frontend
         run: |
-          pip install --upgrade pip
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
-          pip install sam2 huggingface_hub
-          pip install fastapi uvicorn python-multipart
-          pip install pyinstaller
-
-      # CPU torch를 포함해 배포 — 어떤 PC에서도 즉시 실행된다.
-      # NVIDIA GPU가 있으면 앱 안의 [⚡ GPU 가속 켜기]로 CUDA torch를 선택 설치(gpu_setup.py).
-      - name: Build with PyInstaller (Windows)
-        if: runner.os == 'Windows'
-        run: >
-          pyinstaller --onedir --windowed --name "DKPregistrator"
-          --icon app_icon.ico --noconfirm
-          --hidden-import sam2 --hidden-import sam2.sam2_image_predictor
-          --hidden-import sam2.modeling --hidden-import huggingface_hub
-          --hidden-import main_gui
-          --collect-all kornia --collect-all sam2
-          --collect-all uvicorn
-          --add-data "webapp/frontend/dist;webapp/frontend/dist"
-          --add-data "webapp/folder_dialog.ps1;webapp"
-          --exclude-module tensorboard --exclude-module IPython
-          --exclude-module jupyter --exclude-module notebook
-          launcher.py
-
-      - name: Verify bundle (Windows)
+          npm ci
+          npm run verify
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU engine and packaging tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install kornia opencv-python-headless numpy Pillow matplotlib scikit-image
+          python -m pip install sam2 huggingface_hub fastapi uvicorn python-multipart pyinstaller pytest httpx
+      - name: Verify API and geometry contracts
+        run: python -m pytest tests/test_workspace_api.py tests/test_similarity_only.py -q
+      - name: Build native application
+        run: python scripts/build_desktop.py
+      - name: Start actual executable and verify workspace
+        run: python scripts/smoke_desktop.py
+      - name: Zip Windows application
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          $internal = "dist/DKPregistrator/_internal"
-          if (-not (Test-Path "$internal/torch")) { throw "CPU torch must be bundled" }
-          if (-not (Test-Path "$internal/webapp/frontend/dist/index.html")) { throw "frontend missing" }
-          if (-not (Test-Path "$internal/webapp/folder_dialog.ps1")) { throw "folder_dialog.ps1 missing" }
-          "{0:N0} MB" -f ((Get-ChildItem dist/DKPregistrator -Recurse | Measure-Object Length -Sum).Sum / 1MB)
-
-      - name: Build with PyInstaller (macOS)
+        run: Compress-Archive -Path dist/DKPregistrator/* -DestinationPath DKPregistrator-${{ matrix.name }}.zip
+      - name: Zip macOS application preserving permissions
         if: runner.os == 'macOS'
-        run: >
-          pyinstaller --onedir --windowed --name "DKPregistrator" --noconfirm
-          --hidden-import sam2 --hidden-import sam2.sam2_image_predictor
-          --hidden-import sam2.modeling --hidden-import huggingface_hub
-          --hidden-import main_gui
-          --collect-all kornia --collect-all sam2 --collect-all torch
-          --collect-all uvicorn
-          --add-data "webapp/frontend/dist:webapp/frontend/dist"
-          --add-data "webapp/folder_dialog.ps1:webapp"
-          --exclude-module tensorboard --exclude-module IPython
-          --exclude-module jupyter --exclude-module notebook
-          launcher.py
-
-      - name: Zip artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path dist/DKPregistrator/* -DestinationPath DKPregistrator-Windows.zip
-
-      - name: Zip artifact (macOS)
-        if: runner.os == 'macOS'
-        run: cd dist && zip -ry ../DKPregistrator-macOS.zip DKPregistrator.app/
-
-      - name: Verify macOS zip permissions
-        if: runner.os == 'macOS'
-        run: zipinfo DKPregistrator-macOS.zip | head -20
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        run: ditto -c -k --sequesterRsrc --keepParent dist/DKPregistrator.app DKPregistrator-${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
         with:
           name: DKPregistrator-${{ matrix.name }}
           path: DKPregistrator-${{ matrix.name }}.zip
+          if-no-files-found: error
           retention-days: 30
-
-      - name: Release (on tag)
-        uses: softprops/action-gh-release@v2
+      - name: Attach executables to release
         if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
           files: DKPregistrator-${{ matrix.name }}.zip
+          fail_on_unmatched_files: true

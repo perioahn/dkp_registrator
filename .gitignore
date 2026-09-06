@@ -27,3 +27,7 @@ webapp/frontend/node_modules/
 .gstack/
 
 _tmp_*
+webapp/frontend/test-results/
+webapp/frontend/playwright-report/
+webapp/frontend/e2e/artifacts/
+webapp/frontend/e2e/fixtures/

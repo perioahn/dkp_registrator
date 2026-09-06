@@ -13,7 +13,6 @@ from matching import apply_soft_mask, filter_by_mask, loftr_match
 from preprocess import apply_clahe, auto_orient_and_crop, resize_to_max
 from transform import (
     compose_full_matrix,
-    quality_gate_affine,
     quality_gate_similarity,
 )
 
@@ -156,7 +155,7 @@ def _fit_affine_lstsq(src: np.ndarray, dst: np.ndarray,
 
 
 def _run_gate(k0, k1, conf, tooth_area, cfg: PipelineConfig = DEFAULT):
-    """Similarity → Affine 폴백으로 RANSAC + quality gate 수행."""
+    """Similarity RANSAC; affine 후보 인라이어도 similarity로 다시 적합한다."""
     # Similarity
     M_sim, inliers_sim = cv2.estimateAffinePartial2D(
         k1, k0, method=cv2.RANSAC,
@@ -171,24 +170,15 @@ def _run_gate(k0, k1, conf, tooth_area, cfg: PipelineConfig = DEFAULT):
         k1, k0, method=cv2.RANSAC,
         ransacReprojThreshold=cfg.ransac_thresh, confidence=0.99)
 
-    if not cfg.allow_affine:
-        # 비율 보존 구제: affine이 찾은 inlier로 similarity를 재적합해 다시 게이트.
-        # (affine 변환 자체는 쓰지 않으므로 전단·비등방 배율이 결과에 들어갈 수 없다)
-        if M_aff is not None and inliers_aff is not None and inliers_aff.sum() >= cfg.min_matches:
-            idx = inliers_aff.ravel().astype(bool)
-            M_res = _fit_similarity_lstsq(k1[idx], k0[idx])
-            if M_res is not None:
-                status, met = quality_gate_similarity(
-                    k0, k1, M_res, inliers_aff, tooth_area, cfg=cfg.sim_gate)
-                if status in ('pass', 'warn'):
-                    return M_res, inliers_aff, 'similarity', status, met, conf
-        return None, None, 'none', 'fail', {}, conf
-
-    if M_aff is not None:
-        status, met = quality_gate_affine(
-            k0, k1, M_aff, inliers_aff, tooth_area, cfg=cfg.aff_gate)
-        if status in ('pass', 'warn'):
-            return M_aff, inliers_aff, 'affine', status, met, conf
+    # Affine is only an inlier proposal, never an output model (including legacy configs).
+    if M_aff is not None and inliers_aff is not None and inliers_aff.sum() >= cfg.min_matches:
+        idx = inliers_aff.ravel().astype(bool)
+        M_res = _fit_similarity_lstsq(k1[idx], k0[idx])
+        if M_res is not None:
+            status, met = quality_gate_similarity(
+                k0, k1, M_res, inliers_aff, tooth_area, cfg=cfg.sim_gate)
+            if status in ('pass', 'warn'):
+                return M_res, inliers_aff, 'similarity', status, met, conf
     return None, None, 'none', 'fail', {}, conf
 
 
@@ -266,12 +256,14 @@ def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
         ak1 = np.concatenate([k1[inl], np.repeat(a_m, n_dup, axis=0)])
         w = np.concatenate([conf[inl],
                             np.full(len(a_f) * n_dup, 1.0)])
-        fit_fn = (_fit_similarity_lstsq if gate == 'similarity'
-                  else _fit_affine_lstsq)
+        fit_fn = _fit_similarity_lstsq
         M_r = fit_fn(ak1, ak0, weights=w)
         if M_r is not None:
             M_use = M_r
 
+    status, met = quality_gate_similarity(k0, k1, M_use, inliers, tooth_area, cfg=cfg.sim_gate)
+    if anchor_f_crop:
+        met["anchor_residuals"] = np.linalg.norm((M_use[:, :2] @ a_m.T).T + M_use[:, 2] - a_f, axis=1).tolist()
     try:
         M_full = compose_full_matrix(
             M_use, M_rot_f, crop_off_f, sf, M_rot_m, crop_off_m, sm)
@@ -306,7 +298,7 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
         moving_img: 이동상 RGB 배열.
         fixed_mask: 고정상 마스크 uint8.
         moving_mask: 이동상 마스크 uint8.
-        anchor_points: [(fx, fy, mx, my), ...] 강제 대응점.
+        anchor_points: [(fx, fy, mx, my), ...] 가중 보조 대응점 (강제 제약 아님).
         cfg: 파이프라인 설정 (config.PROFILES 참고).
 
     Returns:
@@ -471,13 +463,22 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
         w = np.concatenate([last_conf[inl],
                             np.full(len(a_f) * n_dup, 1.0)])
 
-        fit_fn = (_fit_similarity_lstsq if final_gate == 'similarity'
-                  else _fit_affine_lstsq)
+        fit_fn = _fit_similarity_lstsq
         M_r = fit_fn(ak1, ak0, weights=w)
         if M_r is not None:
             M_use = M_r
             print(f"[Pyramid] Anchor refit: {len(a_f)} anchors x{n_dup} "
                   f"+ {n_inl} inliers (weighted)")
+
+    # Score the final composed transform, including anchor refit, in one frame.
+    pts = np.column_stack([last_kpts1, np.ones(len(last_kpts1))])
+    unwarped = (np.linalg.inv(last_M_scaled) @ pts.T).T[:, :2]
+    final_status, final_metrics = quality_gate_similarity(
+        last_kpts0, unwarped, M_use, last_inliers,
+        float(np.sum(fmc > 0)) * final_sf ** 2, cfg=cfg.sim_gate)
+    if anchor_f_crop:
+        final_metrics["anchor_residuals"] = np.linalg.norm(
+            (M_use[:, :2] @ a_m.T).T + M_use[:, 2] - a_f, axis=1).tolist()
 
     # ── Compose full matrix + warp ──
     try:
