@@ -54,11 +54,23 @@ const fixed = computed(
 const active = computed(
   () => photos.value.find((i) => i.id === activeId.value) ?? null,
 );
+const photoNames = new Intl.Collator('ko', {numeric: true, sensitivity: 'base'});
+const orderedPhotos = computed(() => [...photos.value].sort((a,b) => photoNames.compare(a.name,b.name)));
+const fixedDropActive = ref(false);
+function dragPhoto(e: DragEvent, id: string) {
+  e.dataTransfer?.setData('application/x-dkp-photo', id);
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+}
+function dropFixed(e: DragEvent) {
+  fixedDropActive.value = false;
+  const id = e.dataTransfer?.getData('application/x-dkp-photo');
+  if (id && photos.value.some(p => p.id === id)) changeFixed(id);
+}
 const moving = computed(() =>
-  photos.value.filter((i) => i.id !== fixedId.value),
+  orderedPhotos.value.filter((i) => i.id !== fixedId.value),
 );
 const filtered = computed(() =>
-  photos.value.filter(
+  orderedPhotos.value.filter(
     (p) =>
       p.name.toLocaleLowerCase().includes(search.value.toLocaleLowerCase()) &&
       (filter.value === "all" ||
@@ -164,12 +176,6 @@ async function refresh() {
       activeId.value =
         d.images.find((p: Photo) => p.id !== fixedId.value)?.id ??
         fixedId.value;
-    else if (
-      oldFixed &&
-      oldFixed !== fixedId.value &&
-      activeId.value === fixedId.value
-    )
-      activeId.value = oldFixed;
   } catch (e) {
     report(e);
   }
@@ -472,6 +478,7 @@ function badge(p: Photo) {
   if (p.result?.latest_attempt_failed) return "이번 실패 · 이전 결과";
   if (!p.result) return "미정합";
   if (p.result.status === "fail") return "정합 실패";
+  if (p.result.different_reference) return "이전 기준 결과";
   if (p.result.freshness !== "current") return "다시 확인 필요";
   if (p.result.review_status === "confirmed") return "확인됨";
   if (p.result.review_status === "needs_work") return "보정 필요";
@@ -549,9 +556,15 @@ onUnmounted(() => {
         aria-label="정합할 사진 추가"
         @change="upload(($event.target as HTMLInputElement).files)"
       />
-      <div v-if="fixed" class="reference-summary">
-        <span class="eyebrow">기준 사진</span
-        ><strong :title="fixed.name">{{ fixed.name }}</strong
+      <div v-if="fixed" class="reference-summary fixed-slot" data-testid="fixed-slot"
+        :class="{ 'drop-active': fixedDropActive }"
+        @dragover.stop.prevent="fixedDropActive = true"
+        @dragleave="fixedDropActive = false"
+        @drop.stop.prevent="dropFixed"
+        title="목록의 사진을 이 슬롯에 끌어 놓아 기준 사진을 교체하세요">
+        <img :src="`/api/image/${fixed.id}?v=${fixed.revision}`" alt="" />
+        <div class="fixed-slot-copy"><span class="eyebrow">고정 사진 · 끌어 놓아 교체</span>
+        <strong :title="fixed.name">{{ fixed.name }}</strong></div
         ><button :disabled="running" @click="editFixed">기준 편집</button>
       </div>
       <span class="spacer" />
@@ -875,6 +888,8 @@ onUnmounted(() => {
               checked: checked.has(p.id),
             }"
             :data-photo-id="p.id"
+            :draggable="tool !== 'edit'"
+            @dragstart="dragPhoto($event, p.id)"
             @click="select(p.id)"
           >
             <button

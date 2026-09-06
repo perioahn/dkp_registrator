@@ -69,11 +69,10 @@ const isRaw = computed(
   () =>
     props.tool === "anchor" ||
     props.tool === "mask" ||
-    !hasResult.value ||
-    props.fixed.id === props.current.id,
+    !hasResult.value,
 );
 const resultKey = computed(
-  () => `${props.fixed.id}:${props.current.id}:${r.value?.id ?? ""}`,
+  () => `${r.value?.fixed_id ?? props.fixed.id}:${props.current.id}:${r.value?.id ?? ""}`,
 );
 const previous = ref(false);
 watch(resultKey, () => (previous.value = false));
@@ -86,6 +85,7 @@ watch(
 const shownResult = computed(() =>
   previous.value && r.value?.previous ? r.value.previous : r.value,
 );
+const resultReference = computed(() => shownResult.value?.fixed_name || props.fixed.name);
 const leftKey = computed(() =>
   isRaw.value
     ? `raw:${props.fixed.id}`
@@ -510,6 +510,10 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
 </script>
 <template>
   <section class="workspace-body">
+    <div class="context-toolbar" v-if="!isRaw">
+      <span>결과 기준: <strong>{{ resultReference }}</strong></span>
+      <span v-if="shownResult?.fixed_id !== fixed.id" class="notice">이전 고정 사진과의 결과 · 다시 정합하기 전까지 유지</span>
+    </div>
     <div class="context-toolbar" v-if="isRaw && tool !== 'adjust'">
       <span>마스크 대상</span
       ><button
@@ -627,7 +631,7 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
         :src="leftSrc"
         :width="width"
         :height="height"
-        :label="`기준 · ${fixed.name}${!isRaw && r?.freshness !== 'current' ? ' (계산 당시 기준)' : ''}`"
+        :label="`기준 · ${isRaw ? fixed.name : resultReference}${!isRaw && (shownResult?.fixed_id !== fixed.id || r?.freshness !== 'current') ? ' (계산 당시 기준)' : ''}`"
         :view="leftView"
         @update:view="updateView('left', $event)"
         :region-url="leftRegion"

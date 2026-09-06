@@ -52,6 +52,36 @@ test("click first, then A selects anchor or Z commits mask without choosing a to
   await expect.poll(async () => (await state(page)).images[1].n_objects).toBe(0);
 });
 
+test("name order is independent of default fixed; drag replaces the top fixed slot", async ({page}) => {
+  const buffer = fs.readFileSync(fixture(1));
+  await page.locator('input[type=file]').setInputFiles(['z.png','photo-10.png','photo-2.png'].map(name => ({name, mimeType:'image/png', buffer})));
+  await expect(page.locator('.photo-card')).toHaveCount(3);
+  await expect(page.getByTestId('fixed-slot')).toContainText('z.png');
+  await expect(page.locator('.card-copy strong')).toHaveText(['photo-2.png','photo-10.png','z.png']);
+  await page.locator('.photo-card').filter({has:page.getByRole('button',{name:'사진 보기 photo-10.png',exact:true})}).dragTo(page.getByTestId('fixed-slot'));
+  await expect(page.getByTestId('fixed-slot')).toContainText('photo-10.png');
+  await expect(page.locator('.photo-card')).toHaveCount(3);
+  await page.getByRole('button',{name:'↶ 되돌리기',exact:true}).click();
+  await expect(page.getByTestId('fixed-slot')).toContainText('z.png');
+});
+
+test("fixed replacement leaves previous result and reference visible until registering again", async ({page}) => {
+  await upload(page,3);
+  await select(page,2);
+  await page.getByRole('button',{name:'현재 정합',exact:true}).click();
+  await idle(page);
+  const old = (await state(page)).images[1].result.id;
+  await page.locator('.photo-card').filter({has:page.getByRole('button',{name:'사진 보기 photo-3.png',exact:true})}).dragTo(page.getByTestId('fixed-slot'));
+  await expect(page.getByTestId('fixed-slot')).toContainText('photo-3.png');
+  await expect(page.getByTestId('active-name')).toHaveText('photo-2.png');
+  await expect(page.locator('.context-toolbar')).toContainText(['결과 기준: photo-1.png']);
+  expect((await state(page)).images[1].result.id).toBe(old);
+  await page.getByRole('button',{name:'현재 정합',exact:true}).click();
+  await idle(page);
+  await expect(page.locator('.context-toolbar')).toContainText(['결과 기준: photo-3.png']);
+  expect((await state(page)).images[1].result.id).not.toBe(old);
+});
+
 test("upload, fifth result, preserve checks and navigation, save selected", async ({
   page,
 }) => {

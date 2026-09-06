@@ -1080,3 +1080,13 @@ small,
   background: #302818;
   color: #ffe0a9;
 }
+.fixed-slot {
+  border: 1px dashed #698672;
+  border-radius: 8px;
+  padding: 4px 8px;
+  background: #22302a;
+}
+.fixed-slot.drop-active { border-style: solid; outline: 2px solid var(--accent); }
+.fixed-slot > img { width: 48px; height: 38px; object-fit: contain; border-radius: 3px; }
+.fixed-slot-copy { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+@media(max-width: 1000px) { .fixed-slot > img { display: none; } .fixed-slot { gap: 5px; margin-left: 0; } }

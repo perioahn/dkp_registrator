@@ -354,7 +354,7 @@ def state() -> dict:
                 "has_current": st.get("current") is not None,
                 "mask_ready": _union_mask(i) is not None,
                 "mask_rev": st.get("rev", 0), "mask_points": st.get("points", []),
-                "result": _result_summary(SESSION.results.get(i)),
+                "result": _result_summary(SESSION.display_result(i)),
             }
         return {"version": APP_VERSION, "images": [img_info(i) for i in SESSION.order],
                 "fixed": SESSION.fixed_id(), "fixed_id": SESSION.fixed_id(),
@@ -370,6 +370,8 @@ def _result_summary(r: dict | None) -> dict | None:
     freshness = _freshness(r)
     return {
         "id": r.get("id"), "fixed_id": r.get("fixed_id"),
+        "fixed_name": r.get("fixed_name", ""),
+        "different_reference": r.get("fixed_id") != SESSION.fixed_id(),
         "fixed_revision": r.get("fixed_revision"), "moving_revision": r.get("moving_revision"),
         "full_w": r.get("fixed_img", np.empty((0, 0))).shape[1],
         "full_h": r.get("fixed_img", np.empty((0, 0))).shape[0],
@@ -380,7 +382,7 @@ def _result_summary(r: dict | None) -> dict | None:
         "has_previous": r.get("previous") is not None,
         "previous": {"id": r["previous"]["id"], "full_w": r["previous"]["fixed_img"].shape[1],
                      "full_h": r["previous"]["fixed_img"].shape[0],
-                     "fixed_id": r["previous"]["fixed_id"], "fixed_revision": r["previous"]["fixed_revision"]}
+                     "fixed_id": r["previous"]["fixed_id"], "fixed_name": r["previous"].get("fixed_name", ""), "fixed_revision": r["previous"]["fixed_revision"]}
                     if r.get("previous") else None,
         "status": r.get("status"), "gate": r.get("gate"),
         "label": r.get("label"), "reason": r.get("reason"),
@@ -489,6 +491,7 @@ def delete_image(img_id: str) -> dict:
             SESSION.set_fixed(SESSION.order[0] if SESSION.order else None)
         SESSION.anchors = {k: v for k, v in SESSION.anchors.items() if img_id not in k}
         SESSION.result_pairs.pop(img_id, None)
+        SESSION.displayed_results = {mid: fid for mid, fid in SESSION.displayed_results.items() if mid != img_id and fid != img_id}
         for results in SESSION.result_pairs.values():
             results.pop(img_id, None)
         _record("사진 삭제", img_id, before)
@@ -825,22 +828,23 @@ def _run_registration(lazy: bool, profile: str, movings: list[str]) -> None:
                 # two additional full-resolution arrays per registered photo.
                 entry.pop("false_color", None)
                 results = session.result_pairs.setdefault(fixed_id, {})
-                prev = results.get(mid)
+                prev = session.display_result(mid)
                 failed = entry.get("status") == "fail"
                 kept = bool(failed and prev and prev.get("registered_img") is not None)
                 if kept:
                     prev = snapshot(prev)
                     prev.update(latest_attempt_failed=True, latest_attempt_reason=entry.get("reason") or "품질 기준 미달")
-                    results[mid] = prev
+                    session.result_pairs[prev['fixed_id']][mid] = prev
                 else:
                     entry.update(latest_attempt_failed=failed, latest_attempt_reason=entry.get("reason") if failed else None)
                     if prev and prev.get("registered_img") is not None:
                         entry["previous"] = {k: v for k, v in snapshot(prev).items() if k != "previous"}
                     results[mid] = entry
+                    session.displayed_results[mid] = fixed_id
                 job["done"] += 1
                 job["items"][mid] = "failed" if failed else "done"
                 session.record("정합 재시도" if kept else "정합 결과", mid, before)
-                _job_event(job, "one_done", id=mid, moving_id=mid, summary=_result_summary(results[mid]), kept=kept)
+                _job_event(job, "one_done", id=mid, moving_id=mid, summary=_result_summary(session.display_result(mid)), kept=kept)
     except Exception as e:
         log.exception("registration job failed")
         job["error"] = str(e)
@@ -892,7 +896,7 @@ def stop_registration():
 
 
 def _result_image(mid: str, kind: str, previous=False) -> np.ndarray:
-    r = SESSION.results.get(mid)
+    r = SESSION.display_result(mid)
     if previous and r:
         r = r.get("previous")
     if not r:
@@ -993,7 +997,7 @@ def _encode_result_jpg(mid: str) -> tuple[str, bytes]:
     """(파일명, JPEG 바이트) — 개별 다운로드와 동일 규칙."""
     with SESSION.lock:
         img = _result_image(mid, "registered")
-        fixed_name = os.path.splitext(SESSION.results[mid]["fixed_name"])[0]
+        fixed_name = os.path.splitext(SESSION.display_result(mid)["fixed_name"])[0]
         mov_name = os.path.splitext(SESSION.images[mid]["name"])[0]
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                            [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -1011,12 +1015,12 @@ def save_results(dir: str = Body(embed=True),
     with SESSION.lock:
         if expected_fixed_id is not None and expected_fixed_id != SESSION.fixed_id():
             raise HTTPException(409, "저장 폴더를 선택하는 동안 기준이 바뀌었습니다. 저장할 결과를 다시 선택해 주세요.")
-        if expected_results is not None and any(SESSION.results.get(mid, {}).get("id") != rid for mid, rid in expected_results.items()):
+        if expected_results is not None and any((SESSION.display_result(mid) or {}).get("id") != rid for mid, rid in expected_results.items()):
             raise HTTPException(409, "저장 폴더를 선택하는 동안 결과가 바뀌었습니다. 저장할 결과를 다시 선택해 주세요.")
         if not os.path.isdir(dir):
             raise HTTPException(400, f"폴더가 없습니다: {dir}")
         targets = [m for m in SESSION.moving_ids()
-                   if (only is None or m in set(only)) and SESSION.results.get(m)]
+                   if (only is None or m in set(only)) and SESSION.display_result(m)]
         if not targets:
             raise HTTPException(409, "저장할 정합 결과가 없습니다")
         saved, failed = [], []
@@ -1063,7 +1067,7 @@ def previous_result_image(mid: str, kind: str, max_side: int = 1600):
 @app.post("/api/result/{mid}/review")
 def review_result(mid: str, result_id: str = Body(embed=True), status: str = Body(embed=True)):
     with SESSION.lock:
-        r = SESSION.results.get(mid)
+        r = SESSION.display_result(mid)
         if not r or r.get("id") != result_id:
             raise HTTPException(409, "결과가 변경됐습니다. 현재 결과를 다시 확인하세요")
         if status not in ("unreviewed", "confirmed", "needs_work"):
@@ -1104,7 +1108,7 @@ def adjust_result(mid: str,
                   reset: bool = Body(default=False, embed=True)) -> dict:
     with SESSION.lock:
         _require_idle()
-        r = SESSION.results.get(mid)
+        r = SESSION.display_result(mid)
         if not r or r.get("M_full") is None:
             raise HTTPException(404, "결과 없음")
         if result_id is not None and result_id != r.get("id"):
@@ -1138,7 +1142,7 @@ def adjust_result(mid: str,
         # Automatic match metrics no longer describe a manual transform.
         r["metrics"] = {"scale": float(np.sqrt(np.linalg.det(new_M[:2, :2]))),
                         "rotation_deg": float(np.degrees(np.arctan2(new_M[1, 0], new_M[0, 0])))}
-        SESSION.results[mid] = r
+        SESSION.result_pairs[r['fixed_id']][mid] = r
         _record("정합 미세조정", mid, before)
         return {"ok": True, "manual_adjusted": r["manual_adjusted"], "result_id": r["id"], "ts": time.time_ns()}
 

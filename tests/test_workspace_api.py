@@ -76,6 +76,26 @@ def test_preview_is_uncommitted_until_z_and_rejects_stale_commit(client):
     assert client.post(f'/api/mask/{image_id}/action', json={'action':'confirm','draft_token':draft['token']}).status_code == 409
 
 
+def test_change_fixed_keeps_last_displayed_result_until_reregister(client, monkeypatch):
+    a, b, c = add(client)
+    monkeypatch.setattr(s, 'register_test', engine_result)
+    client.post('/api/register', json={'only':[b]}); wait_done()
+    previous = client.get('/api/state').json()['images'][1]['result']
+    client.post('/api/fixed', json={'image_id':c,'base_revision':s.SESSION.revision})
+    shown = client.get('/api/state').json()['images'][1]['result']
+    assert shown['id'] == previous['id'] and shown['fixed_id'] == a
+    assert shown['different_reference'] is True
+    assert client.get(f'/api/result/{b}/fixed').status_code == 200
+    client.post('/api/register', json={'only':[b]}); wait_done()
+    latest = client.get('/api/state').json()['images'][1]['result']
+    assert latest['id'] != previous['id'] and latest['fixed_id'] == c
+    client.post('/api/fixed', json={'image_id':a,'base_revision':s.SESSION.revision})
+    assert client.get('/api/state').json()['images'][1]['result']['id'] == latest['id']
+    client.post('/api/history/undo')
+    client.post('/api/history/undo')
+    assert client.get('/api/state').json()['images'][1]['result']['id'] == previous['id']
+
+
 def test_upload_rejects_individually_and_default_fixed(client):
     r = client.post("/api/upload", files=[("files", ("bad.png", b"invalid", "image/png")), ("files", ("ok.png", png(np.zeros((20, 30, 3), np.uint8)), "image/png"))])
     assert r.status_code == 200

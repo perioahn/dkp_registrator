@@ -15,6 +15,7 @@ class Session:
         self.masks = {}
         self.anchors = {}
         self.result_pairs = {}
+        self.displayed_results = {}
         self.fixed = None
         self.revision = 0
         self.running = False
@@ -33,6 +34,10 @@ class Session:
     def results(self):
         return self.result_pairs.setdefault(self.fixed, {})
 
+    def display_result(self, image_id):
+        reference = self.displayed_results.get(image_id, self.fixed)
+        return self.result_pairs.get(reference, {}).get(image_id)
+
     def set_fixed(self, image_id):
         self.fixed = image_id
         for i, im in self.images.items():
@@ -40,7 +45,7 @@ class Session:
 
     def snapshot(self):
         return snapshot({k: getattr(self, k) for k in
-                         ("images", "order", "masks", "anchors", "result_pairs", "fixed")})
+                         ("images", "order", "masks", "anchors", "result_pairs", "displayed_results", "fixed")})
 
     def record(self, label, image_id, before):
         self.revision += 1

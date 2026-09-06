@@ -14,6 +14,8 @@ export interface ResultInfo {
   label: string;
   reason?: string;
   fixed_id: string;
+  fixed_name?: string;
+  different_reference?: boolean;
   fixed_revision: number | string;
   freshness: string;
   review_status: string;
@@ -26,6 +28,7 @@ export interface ResultInfo {
     full_w: number;
     full_h: number;
     fixed_id: string;
+    fixed_name?: string;
     fixed_revision: number | string;
   };
   n_inlier?: number;
