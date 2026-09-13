@@ -14,6 +14,8 @@ from PIL import Image, ImageDraw
 
 binary = Path('dist/DKPregistrator/DKPregistrator.exe') if sys.platform == 'win32' else Path('dist/DKPregistrator.app/Contents/MacOS/DKPregistrator')
 assert binary.is_file(), binary
+source = Path('webapp/server.py').read_text(encoding='utf-8')
+expected_version = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)[1]
 port = 18798
 base = f'http://127.0.0.1:{port}'
 with tempfile.TemporaryDirectory(prefix='dkp-native-smoke-') as temp:
@@ -40,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix='dkp-native-smoke-') as temp:
             assert '사진 추가' in ui and '기준 편집' in ui
         with urllib.request.urlopen(base+'/api/app') as response:
             identity=json.load(response)
-        assert identity['version'] == '1.5.1'
+        assert identity['version'] == expected_version
         pixels = io.BytesIO()
         photo=Image.new('RGB',(256,256),(35,35,35))
         ImageDraw.Draw(photo).ellipse((60,40,190,220), fill=(240,230,200))
