@@ -48,7 +48,7 @@ from register import (  # noqa: E402
 from anchor_recovery import recommend_anchors, register_anchors
 
 log = logging.getLogger(__name__)
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 
 SAM2_MAX_SIDE = 1024
 
@@ -1170,6 +1170,8 @@ def _display_false_color(fixed, registered):
 # ── GPU 가속 (선택 설치) ───────────────────────────
 
 _gpu_state = {"installing": False, "phase": "", "done": 0, "total": 0, "error": ""}
+_web_server = None
+_restart_requested = False
 
 
 @app.get("/api/gpu")
@@ -1185,7 +1187,8 @@ def gpu_status() -> dict:
     return {"device": _torch_device(), "gpu_name": gpu_setup.gpu_name(),
             "installed": gpu_setup.installed(), "frozen": getattr(sys, "frozen", False),
             "mode": compute_device.mode(), "accelerator": compute_device.accelerator(),
-            "platform": sys.platform, "models": models,
+            "platform": sys.platform, "models": models, "install_dir": gpu_setup.base_dir(),
+            "process_id": os.getpid(), "can_restart": _web_server is not None,
             **_gpu_state}
 
 
@@ -1233,7 +1236,7 @@ def _gpu_install_worker() -> None:
     import gpu_setup
     try:
         def on_status(d: dict) -> None:
-            _gpu_state.update(phase=d.get("phase", ""), done=d.get("done", 0),
+            _gpu_state.update(phase=d.get("phase", ""), pkg=d.get("pkg", ""), done=d.get("done", 0),
                               total=d.get("total", 0))
             publish("gpu", dict(_gpu_state))
         gpu_setup.install_cuda(on_status)
@@ -1266,6 +1269,25 @@ def gpu_remove() -> dict:
         raise HTTPException(409, "설치 중에는 제거할 수 없습니다")
     gpu_setup.remove_cuda()
     return {"removed": True}
+
+
+@app.post("/api/gpu/restart")
+def gpu_restart() -> dict:
+    global _restart_requested
+    import gpu_setup
+    with SESSION.lock:
+        _require_idle()
+        if _gpu_state['installing'] or not gpu_setup.installed():
+            raise HTTPException(409, 'GPU 설치가 완료된 뒤 다시 시작하세요.')
+        if _web_server is None:
+            raise HTTPException(409, '실행 파일로 시작한 앱에서 다시 시작하세요.')
+        if not _restart_requested:
+            _restart_requested = True
+            def stop():
+                _web_server.should_exit = True
+                _web_server.force_exit = True  # Close long-lived SSE connections too.
+            threading.Timer(1.0, stop).start()
+    return {"restarting": True}
 
 
 _folder_lock = threading.Lock()
@@ -1595,6 +1617,7 @@ def choose_listener(preferred_port):
 
 
 def main():
+    global _web_server
     import argparse
     import urllib.request
     import webbrowser
@@ -1629,9 +1652,21 @@ def main():
         threading.Thread(target=open_ready, daemon=True).start()
     import uvicorn
     try:
-        uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")).run(sockets=[listener])
+        _web_server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+        _web_server.run(sockets=[listener])
     finally:
         listener.close()
+    if _restart_requested:
+        import subprocess
+        command = [sys.executable]
+        if not getattr(sys, 'frozen', False):
+            command.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'launcher.py'))
+        command += ['--port', str(port), '--no-browser']
+        if args.persist:
+            command.append('--persist')
+        env = os.environ.copy()
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+        subprocess.Popen(command, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 
 if __name__ == "__main__":

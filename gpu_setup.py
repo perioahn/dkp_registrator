@@ -178,7 +178,16 @@ def install_cuda(on_status=None) -> None:
             say(phase="extract", pkg=pkg)
             _log(f"{pkg} 압축 해제")
             with zipfile.ZipFile(whl) as z:
-                z.extractall(tmp)
+                total = sum(info.file_size for info in z.infolist())
+                done, last = 0, 0.0
+                say(phase="extract", pkg=pkg, done=0, total=total)
+                for info in z.infolist():
+                    z.extract(info, tmp)
+                    done += info.file_size
+                    now = time.monotonic()
+                    if now - last > 0.5 or done == total:
+                        say(phase="extract", pkg=pkg, done=done, total=total)
+                        last = now
             os.remove(whl)
         say(phase="finalize")
         shutil.rmtree(d, ignore_errors=True)

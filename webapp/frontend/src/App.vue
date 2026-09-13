@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import Workspace from "./components/Workspace.vue";
 import FixedEditor from "./components/FixedEditor.vue";
+import GpuInstallProgress from "./components/GpuInstallProgress.vue";
 import { prefetchEditorPreview } from "./editorPreview";
 import {
   api,
@@ -639,6 +640,24 @@ async function refreshGpu() {
     gpu.value = await api("/api/gpu");
   } catch {}
 }
+const restartingGpu = ref(false);
+async function restartGpu() {
+  if (!confirm('GPU 가속을 적용하기 위해 앱을 다시 시작합니다. 현재 사진과 결과는 초기화되므로 필요한 결과를 먼저 저장하세요. 계속할까요?')) return;
+  const previous = gpu.value?.process_id;
+  restartingGpu.value = true;
+  try {
+    await api('/api/gpu/restart', {});
+    for (let i = 0; i < 120; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        const response = await fetch('/api/gpu', {signal: AbortSignal.timeout(3000)});
+        const status = await response.json();
+        if (response.ok && status.process_id !== previous) { location.reload(); return; }
+      } catch {}
+    }
+    throw new Error('서버 재연결이 지연되고 있습니다. 잠시 후 화면을 새로고침하세요.');
+  } catch (e) { report(e); restartingGpu.value = false; }
+}
 async function switchDevice(mode: 'auto' | 'cpu') {
   if (switchingDevice.value) return;
   switchingDevice.value = true;
@@ -986,6 +1005,14 @@ onUnmounted(() => {
           </div>
           </details>
           <p v-if="gpu?.device === 'cpu'" class="subtle" data-testid="cpu-help">{{ cpuHelp }}</p>
+          <details v-if="gpu?.platform === 'win32'" class="gpu-requirements">
+            <summary title="NVIDIA GPU와 NVIDIA 드라이버가 필요합니다. CUDA Toolkit을 별도로 설치할 필요는 없습니다.">GPU 사용 조건 ⓘ</summary>
+            <p>{{ gpu.gpu_name ? `✓ 감지된 GPU: ${gpu.gpu_name}` : 'NVIDIA GPU를 감지하지 못했습니다. NVIDIA 그래픽카드가 있는지 확인하고 NVIDIA 드라이버를 설치·업데이트한 뒤 앱을 다시 시작하세요.' }}</p>
+            <p>{{ gpu.frozen ? '✓ Windows 실행 파일 사용 중' : '앱 내 자동 설치는 Windows 배포용 실행 파일에서 지원합니다. 소스 실행은 README의 GPU 환경 설정을 이용하세요.' }}</p>
+            <p>CUDA는 NVIDIA GPU에서 사용합니다. Intel·AMD 그래픽만 있는 PC는 CPU 모드를 사용하세요.</p>
+            <p>인터넷 연결과 다운로드·압축 해제에 충분한 디스크 여유 공간이 필요합니다. CUDA Toolkit은 별도로 설치하지 않아도 됩니다.</p>
+            <p>GPU가 감지돼도 드라이버와 설치된 PyTorch CUDA의 호환 여부에 따라 가속을 사용할 수 없을 수 있습니다.</p>
+          </details>
           <button
             v-if="
               gpu?.gpu_name &&
@@ -999,6 +1026,8 @@ onUnmounted(() => {
             {{ gpu.installing ? "GPU 설치 중…" : "GPU 가속 설치" }}
           </button>
           <p v-if="gpu?.error" class="failure">{{ gpu.error }}</p>
+          <GpuInstallProgress :gpu="gpu" />
+          <button v-if="gpu?.can_restart && (gpu.installed || gpu.phase === 'done') && gpu.device === 'cpu'" :disabled="restartingGpu || gpu.installing || running || starting" @click="restartGpu">{{ restartingGpu ? '다시 시작 중…' : 'GPU 적용하고 다시 시작' }}</button>
         </details>
         <details>
           <summary>단축키</summary>
