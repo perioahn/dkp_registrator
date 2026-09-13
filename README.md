@@ -4,7 +4,7 @@
 
 ## 실행파일
 
-[GitHub Releases](https://github.com/perioahn/dkp_registrator/releases)에서 다운로드합니다.
+[최신 실행 파일](https://github.com/perioahn/dkp_registrator/releases/latest)에서 다운로드합니다.
 
 - **Windows x64:** `DKPregistrator-Windows-x64.zip`을 모두 압축 해제하고 `DKPregistrator.exe` 실행. `_internal` 폴더도 함께 있어야 합니다.
 - **macOS Apple Silicon:** `DKPregistrator-macOS-arm64.zip`을 풀고 `.app` 실행. 개발자 인증·공증을 받은 배포판은 아닙니다. macOS가 차단하면 시스템 설정의 개인정보 보호 및 보안에서 해당 앱의 열기를 허용해야 할 수 있습니다.
@@ -56,11 +56,37 @@
 
 출력 변환은 회전·이동·**균일 배율**만 허용합니다. 방향 탐색은 회전·반전을 사용할 수 있습니다. `relaxed`는 제거했고 API에서도 거절합니다. 전단·축별 다른 배율의 행렬은 일반/폴백/대응점/수동조정/저장 경로에서 허용하지 않습니다. 크롭은 영역만 자릅니다.
 
-기본/엄격 판정은 접힌 **정합 설정**에 있습니다. 맞지 않는 사진은 대응점·마스크·방향 자동탐색을 조정하여 다시 시도할 수 있습니다. 자동 지표와 시각적 검토를 함께 사용하세요.
+맞지 않는 사진은 대응점·마스크·**정합 설정 → 사진 방향 자동탐색**을 조정하여 다시 시도할 수 있습니다. 자동 지표와 시각적 검토를 함께 사용하세요.
 
-## GPU와 소스 실행
+## GPU 가속 — Windows 실행 파일
 
-CPU로 실행할 수 있습니다. Windows 배포판은 CPU PyTorch를 포함하며, NVIDIA GPU가 감지되면 설정에서 GPU 가속 파일을 선택 설치할 수 있습니다. 설치 후 재시작해야 합니다. Apple Silicon은 지원되는 연산에 Metal(MPS)을 사용합니다.
+**GPU 없이도 CPU로 사용할 수 있습니다.** Windows 실행 파일에는 CPU용 PyTorch가 포함되어 있습니다. Apple Silicon은 지원되는 연산에 Metal(MPS)을 사용하며, 아래 CUDA 설치는 Windows NVIDIA GPU용입니다.
+
+### 설치 순서
+
+1. **정합 설정 → GPU 사용 조건 ⓘ**에서 NVIDIA GPU 감지 여부를 확인합니다.
+2. **GPU 가속 설치**를 누릅니다. 현재 자동 설치는 **CUDA 12.4용 PyTorch(`cu124`)**를 사용합니다. CUDA Toolkit을 따로 설치할 필요는 없습니다.
+3. 다운로드 후 압축을 해제합니다. **v1.5.3부터** 설치 위치, 패키지별 다운로드·압축 해제 진행률이 표시됩니다. 퍼센트는 전체 설치가 아닌 현재 패키지의 해당 단계 기준입니다.
+4. 완료되면 필요한 정합 결과를 저장하고 **GPU 적용하고 다시 시작**을 누릅니다(v1.5.3부터). 백그라운드 서버가 다시 실행되고 브라우저 화면이 재연결됩니다. 현재 작업 목록·미저장 결과는 복구되지 않습니다.
+5. 재시작 후 정합 설정에서 **NVIDIA GPU 사용**을 확인합니다. 첫 계산은 모델 준비 때문에 더 오래 걸릴 수 있습니다.
+
+기본 설치 위치는 `%LOCALAPPDATA%\DKPRegistrator\cuda`입니다. 예: `C:\Users\사용자이름\AppData\Local\DKPRegistrator\cuda`. 다운로드·압축 해제 중에는 옆의 `cuda.tmp` 폴더를 사용합니다. 인터넷 연결과 다운로드 파일 및 압축 해제 파일을 함께 저장할 디스크 여유가 필요합니다.
+
+### GPU·드라이버 조건
+
+- **NVIDIA GPU:** 설치되는 PyTorch가 해당 GPU 모델을 지원해야 합니다. Intel·AMD 그래픽만 있는 Windows PC는 CPU로 사용합니다. 최신 GPU도 현재 `cu124` 패키지의 지원 대상인지 별도 확인이 필요합니다.
+- **NVIDIA 드라이버:** 해당 GPU를 지원하는 최신 드라이버를 권장합니다. CUDA 12.4 GA의 Windows 드라이버 기준은 **551.61**입니다. 이것은 앱이 검사하는 차단 기준이 아닙니다. 더 낮은 드라이버의 제한적인 호환 모드는 일반 설치 안내 기준으로 삼지 않습니다.
+- **감지와 실행은 다릅니다:** 앱은 `nvidia-smi`로 GPU 이름을 감지합니다. 이름이 표시되어도 PyTorch·드라이버·GPU의 실제 연산 호환성이 모두 검증된 것은 아닙니다.
+
+**“CUDA 버전이 더 높으면 되나요?”** `nvidia-smi`의 **CUDA Version**은 드라이버가 지원하는 CUDA 버전이며, 설치된 Toolkit 버전이 아닙니다. 새 드라이버는 이전 CUDA 앱과 하위 호환되므로 12.6·12.8·13.x가 표시된다고 12.4로 낮출 필요는 없습니다. 다만 GPU 모델 자체도 앱의 PyTorch에서 지원해야 합니다. **CUDA Toolkit만 새로 설치하는 것은 드라이버 업데이트를 대신하지 못합니다.**
+
+GPU가 감지되지 않으면 NVIDIA 드라이버를 설치·업데이트하고 앱을 다시 실행하세요. 설치 후에도 CPU로 표시되면 정합 설정의 안내를 확인하세요. 설치 오류 기록은 `%LOCALAPPDATA%\DKPRegistrator\gpu_setup.log`에 남습니다.
+
+공식 근거: [NVIDIA CUDA 하위 호환성](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html), [CUDA 12.4 릴리스·드라이버 정보](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-toolkit-release-notes/index.html).
+
+## 소스 실행 — 개발자용
+
+실행 파일 사용자는 아래 작업이 필요 없습니다. 별도 Python 환경에서 의존성을 설치하고 실행합니다.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -68,6 +94,8 @@ python launcher.py
 ```
 
 검증 환경은 Windows Python 3.13이며, 배포 빌드는 Python 3.11을 사용합니다. `python launcher.py --tk`는 이전 Tk 인터페이스입니다. 이 README의 새 작업대·단축키 설명은 기본 웹 인터페이스 기준입니다.
+
+소스 실행에서 GPU를 사용하려면 [PyTorch 공식 설치 안내](https://pytorch.org/get-started/locally/)에서 운영체제·GPU에 맞는 PyTorch를 해당 Python 환경에 설치하세요. `requirements.txt`는 CUDA 버전을 고정하지 않습니다. 앱의 자동 GPU 설치 버튼은 Windows 배포 실행 파일용이며, 소스 환경의 CUDA 버전과 배포판의 `cu124`를 혼동하지 마세요.
 
 세션은 현재 서버 실행 동안 유지됩니다. 서버 재시작 복구는 아직 제공하지 않습니다. 기존 세션 폴더를 시작할 때 지우지 않으며, 테스트는 `DKP_SESSION_ROOT` 또는 주입한 임시 경로로 격리합니다.
 
