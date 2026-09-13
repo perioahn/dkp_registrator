@@ -48,7 +48,7 @@ from register import (  # noqa: E402
 from anchor_recovery import recommend_anchors, register_anchors
 
 log = logging.getLogger(__name__)
-APP_VERSION = "1.5.1-local.12"
+APP_VERSION = "1.5.2"
 
 SAM2_MAX_SIDE = 1024
 

@@ -43,7 +43,7 @@ test('focus enlarges photos and restores sidebar preference without resetting na
 test('compact screen keeps version visible and thumbnails request only 256 pixels', async ({page}) => {
   await page.setViewportSize({width:1024,height:600});
   await expect(page.getByTestId('app-version')).toBeVisible();
-  await expect(page.getByTestId('app-version')).toContainText(/1\.5\.1-local\.\d+/);
+  await expect(page.getByTestId('app-version')).toContainText(/\d+\.\d+\.\d+(?:-local\.\d+)?/);
   const src = await page.locator('.thumbnail-button img').first().getAttribute('src');
   expect(src).toContain('max_side=256');
   await expect(page.locator('.photo-viewport.mask-active')).toHaveCount(1);
