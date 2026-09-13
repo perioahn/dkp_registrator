@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import PhotoEditorCanvas from './PhotoEditorCanvas.vue'
+import EditorControls from './EditorControls.vue'
+import { getEditorPreview } from '../editorPreview'
 import { freshEdits, renderEditedPNG, type Edits } from '../photoEdits'
 
-const props = defineProps<{ image: { id: string; name: string; revision: number | string; edits?: Partial<Edits> | null }; busy?: boolean }>()
+const props = defineProps<{ image: { id: string; name: string; revision: number | string; source_w?: number; source_h?: number; edits?: Partial<Edits> | null }; busy?: boolean }>()
 const emit = defineEmits<{ applied: []; cancel: []; error: [message: string] }>()
 const root = ref<HTMLElement | null>(null)
 const canvas = ref<InstanceType<typeof PhotoEditorCanvas> | null>(null)
-const photo = ref<{ id: string; name: string; file: File } | null>(null)
+const photo = ref<{ id: string; name: string; file: File; sourceWidth: number; sourceHeight: number } | null>(null)
 const draft = ref<Edits>(freshEdits()), undoStack = ref<Edits[]>([]), redoStack = ref<Edits[]>([])
+const previewBusy = ref(false)
 const loading = ref(true), applying = ref(false), loadError = ref('')
 const mode = ref<'view' | 'crop'>('view'), straighten = ref(false), before = ref(false), wholeOriginal = ref(false)
-const cropRatio = ref<number | null>(null), customW = ref<number | null>(null), customH = ref<number | null>(null)
-const ratios: [string, number][] = [['1:1',1],['4:3',4/3],['3:2',3/2],['16:10',1.6],['16:9',16/9]]
+const cropRatio = ref<number | null>(null)
 const copy = (e: Edits): Edits => JSON.parse(JSON.stringify(e))
-const disabled = computed(() => loading.value || applying.value || props.busy)
+const disabled = computed(() => loading.value || previewBusy.value || applying.value || props.busy)
 let initial = freshEdits(), cropStart: Edits | null = null, gesture = false, recorded = false
 let controller: AbortController | null = null
 let baseRevision: number | string = props.image.revision
@@ -24,15 +26,14 @@ const viewEdits = computed(() => wholeOriginal.value ? freshEdits() : draft.valu
 async function load() {
   controller?.abort(); controller = new AbortController()
   const signal = controller.signal
+  const target = {id: props.image.id, name: props.image.name, revision: props.image.revision, edits: {...props.image.edits}}
   loading.value = true; loadError.value = ''; photo.value = null
   try {
-    const response = await fetch(`/api/image/${props.image.id}/source`, { signal })
-    if (!response.ok) throw new Error('원본 사진을 읽지 못했습니다.')
-    const blob = await response.blob()
+    const loaded = await getEditorPreview(target)
     if (signal.aborted) return
-    photo.value = { id: props.image.id, name: props.image.name, file: new File([blob], props.image.name, { type: 'image/png' }) }
-    initial = { ...freshEdits(), ...props.image.edits }
-    baseRevision = props.image.revision
+    photo.value = loaded
+    initial = { ...freshEdits(), ...target.edits }
+    baseRevision = target.revision
     draft.value = copy(initial); undoStack.value = []; redoStack.value = []
     mode.value = 'view'; before.value = false; wholeOriginal.value = false; cropStart = null
   } catch (e: any) { if (!signal.aborted) { loadError.value = e.message; emit('error', e.message) } }
@@ -80,19 +81,18 @@ function undo(redo = false) {
 }
 function reset() { if (!disabled.value) { record(); draft.value = freshEdits() } }
 function angle(deg: number) { fine(draft.value.fineDeg - deg); straighten.value = false }
-function customRatio() { if (customW.value && customH.value && customW.value > 0 && customH.value > 0) cropRatio.value = customW.value / customH.value }
-function numeric(key: 'brightness'|'contrast'|'fineDeg', event: Event) {
-  const value = (event.target as HTMLInputElement).valueAsNumber
-  if (!Number.isFinite(value)) return
-  if (key==='fineDeg') fine(value)
-  else set(key,Math.max(-100,Math.min(100,value)))
+function controlChange(key:'brightness'|'contrast'|'rot90'|'flipH'|'flipV',value:number|boolean) {
+  if(key==='flipH'||key==='flipV') set(key,Boolean(value)); else set(key,Number(value))
 }
 async function apply() {
   if (!photo.value || disabled.value || mode.value === 'crop') return
   const target = { id: props.image.id, revision: baseRevision, file: photo.value.file, edits: copy(draft.value) }
   applying.value = true
   try {
-    const rendered = await renderEditedPNG(target.file, target.edits)
+    const source = await fetch(`/api/image/${target.id}/source`, {signal:controller?.signal})
+    if(!source.ok) throw new Error('적용할 원본 사진을 읽지 못했습니다.')
+    const original = await source.blob()
+    const rendered = await renderEditedPNG(new File([original],props.image.name,{type:original.type}), target.edits)
     const data = new FormData()
     data.append('image', rendered.blob, 'edited.png')
     data.append('metadata', JSON.stringify({ edits: rendered.edits, G: rendered.G, width: rendered.width,
@@ -130,68 +130,18 @@ defineExpose({ undo, apply, dirty })
 
 <template>
   <section ref="root" class="fixed-editor" tabindex="-1" data-tool="fixed-editor" @keydown="key" :aria-busy="disabled">
-    <header class="fe-header">
-      <div><strong>기준 사진 편집 중</strong><span>{{ image.name }}</span></div>
-      <span class="fe-note">{{ applying ? '원본 해상도로 적용 중…' : '원본을 보존하며, 적용 전까지 정합 기준은 유지됩니다.' }}</span>
-      <button @click="cancel" :disabled="applying">편집 취소</button>
-      <button class="fe-primary" @click="apply" :disabled="disabled || mode === 'crop'">기준에 적용</button>
-    </header>
-    <div class="fe-tools">
-      <template v-if="mode === 'crop'">
-        <strong>크롭 영역</strong><button :aria-pressed="cropRatio === null" @click="cropRatio = null">자유</button>
-        <button v-for="[label,ratio] in ratios" :key="label" :aria-pressed="cropRatio === ratio" @click="cropRatio = ratio">{{ label }}</button>
-        <label class="fe-ratio"><input v-model.number="customW" type="number" min="1" aria-label="크롭 가로 비율" placeholder="가로" @change="customRatio">:<input v-model.number="customH" type="number" min="1" aria-label="크롭 세로 비율" placeholder="세로" @change="customRatio"></label>
-        <button @click="cropApply(true)">크롭 제거</button><button @click="cropCancel">영역 취소</button><button class="fe-primary" @click="cropApply()">영역 적용</button>
-      </template>
-      <template v-else>
-        <button :disabled="disabled || wholeOriginal" @click="set('rot90',(draft.rot90+3)%4)">↶ 90°</button>
-        <button :disabled="disabled || wholeOriginal" @click="set('rot90',(draft.rot90+1)%4)">↷ 90°</button>
-        <button :disabled="disabled || wholeOriginal" @click="set('flipH',!draft.flipH)">좌우 반전</button>
-        <button :disabled="disabled || wholeOriginal" @click="set('flipV',!draft.flipV)">상하 반전</button>
-        <button :disabled="disabled || wholeOriginal" :aria-pressed="straighten" @click="straighten=!straighten">수평선 긋기</button>
-        <button :disabled="disabled || wholeOriginal" @click="enterCrop">크롭 (R)</button>
-      </template>
-      <button @click="canvas?.fitView()">화면에 맞춤 (0)</button>
-    </div>
+    <header class="fe-header"><div><span class="fe-eyebrow">PHOTO EDITOR 0.3 · 기준 사진 편집</span><strong>{{image.name}}</strong></div><span class="fe-note">{{applying?'원본 해상도로 적용 중…':'적용 전까지 정합 기준은 유지됩니다.'}}</span><button @click="cancel" :disabled="applying">편집 취소</button><button class="fe-primary" @click="apply" :disabled="disabled || mode==='crop'">기준에 적용</button></header>
     <div class="fe-body">
       <main>
-        <PhotoEditorCanvas v-if="photo" ref="canvas" :key="photo.id" :photo="photo" :edits="viewEdits" :mode="wholeOriginal ? 'view' : mode" :crop-ratio="cropRatio" :straighten="straighten && !wholeOriginal" :show-original="before" @angle="angle" @fine-deg="fine" @error="emit('error',$event)" />
-        <div v-else class="fe-loading" role="status">{{ loading ? '원본 사진을 불러오는 중…' : loadError }}<button v-if="loadError" @click="load">다시 시도</button></div>
+        <PhotoEditorCanvas v-if="photo" ref="canvas" :key="photo.id" :photo="photo" :edits="viewEdits" :mode="wholeOriginal?'view':mode" :crop-ratio="cropRatio" :straighten="straighten && !wholeOriginal" :show-original="before" @angle="angle" @fine-deg="fine" @error="emit('error',$event)" @busy="previewBusy=$event"/>
+        <div v-else class="fe-loading" role="status">{{loading?'편집 미리보기를 준비하는 중…':loadError}}<button v-if="loadError" @click="load">다시 시도</button></div>
+        <span v-if="before || wholeOriginal" class="fe-comparison">{{wholeOriginal?'원본 전체 표시 중':'보정 전 톤 표시 중 · 구도 유지'}}</span>
+        <div class="fe-view-tools"><button :disabled="!undoStack.length || disabled" @click="undo()">실행취소 · Ctrl/Cmd+Z</button><button :disabled="!redoStack.length || disabled" @click="undo(true)">다시 실행 · Ctrl/Cmd+Shift+Z</button><span class="fe-spacer"/><button :aria-pressed="before" @click="before=!before">보정 전 밝기·대비 (/)</button><button :aria-pressed="wholeOriginal" :disabled="mode==='crop'" @click="wholeOriginal=!wholeOriginal">원본 전체 보기</button><button @click="canvas?.fitView()">화면에 맞춤 (0)</button></div>
       </main>
-      <aside>
-        <h3>밝기와 구도</h3>
-        <label v-for="[label,key,min,max,step] in [['밝기','brightness',-100,100,1],['대비','contrast',-100,100,1],['미세 회전','fineDeg',-15,15,0.1]] as const" :key="key">
-          <span>{{ label }} <output>{{ draft[key] }}{{ key==='fineDeg' ? '°' : '' }}</output></span>
-          <input type="range" :aria-label="label" :value="draft[key]" :min="min" :max="max" :step="step" :disabled="disabled || wholeOriginal" @pointerdown="beginGesture" @pointerup="endGesture" @change="endGesture" @pointercancel="endGesture" @blur="endGesture" @input="key==='fineDeg' ? fine(+($event.target as HTMLInputElement).value) : set(key,+($event.target as HTMLInputElement).value)">
-          <button class="fe-small" @click="key==='fineDeg' ? fine(0) : set(key,0)">기본값</button>
-          <input type="number" :aria-label="`${label} 수치`" :value="draft[key]" :min="min" :max="max" :step="step" :disabled="disabled || wholeOriginal" @focus="beginGesture" @blur="endGesture" @input="numeric(key,$event)">
-        </label>
-        <button :aria-pressed="before" @click="before=!before">보정 전 밝기·대비 (/)</button>
-        <button :aria-pressed="wholeOriginal" :disabled="mode==='crop'" @click="wholeOriginal=!wholeOriginal">원본 전체 보기</button>
-        <p v-if="before || wholeOriginal" role="status">{{ wholeOriginal ? '원본 전체를 보는 중입니다.' : '구도는 유지하고 보정 전 톤을 보는 중입니다.' }}</p>
-        <button :disabled="!undoStack.length || disabled" @click="undo()">실행취소 · Ctrl/Cmd+Z</button>
-        <button :disabled="!redoStack.length || disabled" @click="undo(true)">다시 실행 · Ctrl/Cmd+Shift+Z</button>
-        <button :disabled="disabled" @click="reset">모든 보정 초기화</button>
-        <p>휠: 포인터 중심 확대<br>Space+드래그: 화면 이동<br>크롭은 영역만 자릅니다.</p>
-      </aside>
+      <aside><EditorControls :edits="draft" :mode="mode" :crop-ratio="cropRatio" :straighten="straighten" :disabled="disabled || wholeOriginal" @change="controlChange" @fine="fine" @crop="enterCrop" @apply="cropApply()" @cancel="cropCancel" @clear="cropApply(true)" @ratio="cropRatio=$event" @straighten="straighten=!straighten" @reset="reset" @gesture="$event?beginGesture():endGesture()"/></aside>
     </div>
   </section>
 </template>
-
 <style scoped>
-.fixed-editor { display:flex;flex-direction:column;min-width:0;min-height:0;height:100%;background:#15191f;color:#e8edf3;outline:none }
-.fe-header,.fe-tools { display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid #343b45 }
-.fe-header>div { display:flex;flex-direction:column;gap:3px;min-width:130px }
-.fe-header span,.fe-note { font-size:12px;color:#b0bac7 }
-.fe-note { flex:1 }.fe-header>div>span { max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
-button { min-height:36px;padding:6px 10px;border:1px solid #465262;border-radius:6px;background:#252c36;color:inherit;cursor:pointer;font:inherit;font-size:12px }
-button:hover { border-color:#8fbdf0 }button:disabled { opacity:.45;cursor:default }button:focus-visible,input:focus-visible { outline:2px solid #82b7ef;outline-offset:2px }
-button[aria-pressed=true] { border-color:#7db6ee;background:#28445e }.fe-primary { background:#28669c;border-color:#438cc8 }
-.fe-body { display:flex;flex:1;min-height:0 }.fe-body main { flex:1;min-width:0;background:#0c1015 }
-aside { width:230px;flex-shrink:0;padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;border-left:1px solid #343b45 }
-h3 { font-size:13px;margin:0 0 4px }label { display:block;font-size:12px }label>span { display:flex;justify-content:space-between }input[type=range] { width:100%;accent-color:#7fb0df;margin:10px 0 0 }
-.fe-small { min-height:26px;padding:2px 7px;font-size:11px;float:right }.fe-ratio { display:flex;gap:3px;align-items:center }.fe-ratio input { width:55px;min-height:32px;background:#161d26;color:inherit;border:1px solid #465262;border-radius:4px;padding:5px }
-aside p { font-size:11px;line-height:1.7;color:#b0bac7;margin:0 }.fe-loading { display:flex;gap:10px;align-items:center;justify-content:center;height:100% }
-@media(max-width:1050px) { aside { width:190px;padding:10px }.fe-note { display:none } }
-@media(max-width:700px) { .fe-body { flex-direction:column }.fe-body main { min-height:200px }aside { width:auto;max-height:190px;border-left:0;border-top:1px solid #343b45;display:grid;grid-template-columns:repeat(2,minmax(0,1fr)) }.fe-header>div>span { max-width:150px } }
+.fixed-editor{display:flex;flex-direction:column;min-width:0;min-height:0;height:100%;background:#141d24;color:#e7edf2;outline:none}.fe-header{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid #35424d;flex-wrap:wrap}.fe-header>div{display:flex;flex-direction:column;min-width:130px;max-width:320px}.fe-header strong{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.fe-eyebrow{font-size:10px;letter-spacing:.5px;color:#9ec9b6}.fe-note{flex:1;font-size:11px;color:#a1b1be}.fe-body{display:flex;flex:1;min-height:0}.fe-body main{display:flex;flex-direction:column;flex:1;min-width:0;position:relative;background:#0c1116}.fe-body main :deep(.editor-canvas){flex:1;height:auto;min-height:100px}aside{width:270px;flex-shrink:0;overflow:auto;padding:18px;border-left:1px solid #35424d;background:#1c252d}button{min-height:32px;padding:5px 9px;border:1px solid #465461;border-radius:6px;background:#28333e;color:inherit;font:inherit;font-size:11px;cursor:pointer}button:hover{border-color:#acd8c6}button:disabled{opacity:.4;cursor:default}button[aria-pressed=true]{border-color:#acd8c6;background:#2b493f}button:focus-visible{outline:2px solid #acd8c6;outline-offset:2px}.fe-primary{background:#acd8c6;border-color:#acd8c6;color:#142d23;font-weight:600}.fe-view-tools{display:flex;align-items:center;gap:5px;padding:7px 10px;border-top:1px solid #35424d;flex-shrink:0;flex-wrap:wrap}.fe-spacer{flex:1}.fe-loading{flex:1;display:flex;align-items:center;justify-content:center;gap:10px;color:#a9bac8;font-size:13px}.fe-comparison{position:absolute;top:12px;left:12px;padding:5px 8px;background:#203a30;border:1px solid #97c3b0;color:#c9e7d9;font-size:11px;border-radius:5px;pointer-events:none}@media(max-width:1100px){aside{width:230px;padding:12px}.fe-note{display:none}.fe-view-tools button{font-size:10px}.fe-header>div{flex:1}}@media(max-width:750px){aside{width:205px;padding:10px}.fe-header>div{max-width:190px}.fe-view-tools{gap:4px;padding:5px}}
 </style>

@@ -1,0 +1,31 @@
+{
+  "repository": "perioahn/photo-editor",
+  "commit": "213a40ed607f15b88f91afb28a1f218867522409",
+  "files": [
+    {
+      "source": "src/components/EditorCanvas.vue",
+      "destination": "components/PhotoEditorCanvas.vue",
+      "sha256": "caf567a36a047d4aeeec346e3b88c4125a65187f77b97c41381fbcd36daea7a5"
+    },
+    {
+      "source": "src/components/EditorControls.vue",
+      "destination": "components/EditorControls.vue",
+      "sha256": "e1a6e941f93a0a371113a38685f798833df23df4e1d26d29bf02da93c5de47c9"
+    },
+    {
+      "source": "src/preview.ts",
+      "destination": "preview.ts",
+      "sha256": "e1d4c43c0ff9bb880b33e2a60b2d78d546b12c63b9a1bde97892549bcb9aff0c"
+    },
+    {
+      "source": "src/preview.worker.ts",
+      "destination": "preview.worker.ts",
+      "sha256": "9144e72bc73fb2b18135865f001d201a3d232dd433aa013cc1bf6480bda8ee6e"
+    },
+    {
+      "source": "src/previewCore.ts",
+      "destination": "previewCore.ts",
+      "sha256": "942551eb43f60971815a1f63de676627973e56f842735e5e372d92c7d7b35d3d"
+    }
+  ]
+}

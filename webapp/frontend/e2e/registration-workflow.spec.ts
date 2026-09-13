@@ -32,11 +32,12 @@ test.beforeEach(async ({ page }) => {
 test("click first, then A selects anchor or Z commits mask without choosing a tool", async ({ page }) => {
   await upload(page, 2);
   await expect(page.locator('input[type=file]')).toHaveCount(1);
+  await page.getByRole('button', {name:'대응점 펼치기',exact:true}).click();
   const panes = page.locator('.photo-viewport');
-  await panes.first().click({ position: { x: 160, y: 140 } });
+  await panes.first().click();
   await expect(page.locator('[data-anchor="candidate"]')).toBeVisible();
   await page.keyboard.press('a');
-  await panes.last().click({ position: { x: 160, y: 140 } });
+  await panes.last().click();
   await page.keyboard.press('a');
   await expect.poll(async () => {
     const s = await state(page);
@@ -112,6 +113,9 @@ test("upload, fifth result, preserve checks and navigation, save selected", asyn
   await page.route("**/api/select_folder", (route) =>
     route.fulfill({ json: { path: out } }),
   );
+  await page.getByLabel('저장 방식').selectOption('folder');
+  await page.getByRole('button', {name:'폴더 찾기', exact:true}).click();
+  await expect(page.getByLabel('저장 폴더 경로')).toHaveValue(out);
   await page
     .getByRole("button", { name: "선택 결과 저장 (1)", exact: true })
     .click();
@@ -122,10 +126,10 @@ test("mask Z/X undo restores prompts; C and form shortcuts do nothing", async ({
   page,
 }) => {
   await upload(page, 3);
-  await page.getByRole("button", { name: "점·마스크", exact: true }).click();
+  await page.getByRole("button", { name: "마스크", exact: true }).click();
   const pane = page.locator(".photo-viewport").nth(1);
   await pane.click({ position: { x: 150, y: 150 } });
-  await expect(page.locator('[data-anchor="candidate"]')).toBeVisible();
+  await expect(page.locator('[data-anchor="candidate"]')).toHaveCount(0);
   await expect(page.getByRole("button", { name: /개체 확정/ })).toBeEnabled();
   await pane.press("KeyZ");
   await expect
@@ -138,11 +142,11 @@ test("mask Z/X undo restores prompts; C and form shortcuts do nothing", async ({
   await expect
     .poll(async () => (await state(page)).images[1].n_objects)
     .toBe(0);
-  await pane.press("Control+z");
+  await Promise.all([page.waitForResponse(r => r.url().endsWith('/api/history/undo') && r.request().method() === 'POST'), pane.press("Control+z")]);
   await expect
     .poll(async () => (await state(page)).images[1].n_objects)
     .toBe(1);
-  await pane.press("Control+z");
+  await Promise.all([page.waitForResponse(r => r.url().endsWith('/api/history/undo') && r.request().method() === 'POST'), pane.press("Control+z")]);
   await expect
     .poll(async () => (await state(page)).images[1].mask_points.length)
     .toBe(0);
@@ -156,17 +160,18 @@ test("anchors and changing fixed preserve pair state; review queue advances", as
   page,
 }) => {
   await upload(page, 4);
+  await page.getByRole('button', {name:'대응점 펼치기',exact:true}).click();
   await page.locator(".work-surface").focus();
   await page.keyboard.press("KeyA");
   await page
     .locator(".photo-viewport")
     .nth(0)
-    .click({ position: { x: 150, y: 150 } });
+    .click();
   await page.keyboard.press("KeyA");
   await page
     .locator(".photo-viewport")
     .nth(1)
-    .click({ position: { x: 180, y: 150 } });
+    .click();
   await page.keyboard.press("KeyA");
   await expect(page.locator(".anchor-dot")).toHaveCount(2);
   await page.locator(".work-surface").focus();
@@ -208,10 +213,11 @@ test("original ROI, zoom retention, responsive workspace and editor apply", asyn
   page.on("request", (req) => {
     if (req.url().includes("/region?")) requests.push(req.url());
   });
-  await page.getByRole("button", { name: "100%", exact: true }).click();
+  await expect(page.getByRole("button", { name: "100%", exact: true })).toHaveCount(0);
+  await page.locator('.photo-viewport').first().hover();
+  await page.mouse.wheel(0, -1100);
   await expect.poll(() => requests.length).toBeGreaterThan(0);
-  await page.getByRole("button", { name: "부분 확대", exact: true }).click();
-  await expect(page.locator(".loupe")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "부분 확대", exact: true })).toHaveCount(0);
   for (const [w, h] of [
     [1366, 768],
     [1920, 1080],
@@ -271,9 +277,10 @@ test("old result uses its pinned dimensions and high-resolution overlay; manual 
     "1600px",
   );
   await page.getByRole("button", { name: "와이프", exact: true }).click();
-  await page.getByRole("button", { name: "100%", exact: true }).click();
+  await page.locator('.photo-viewport').first().hover();
+  await page.mouse.wheel(0, -1100);
   await expect.poll(() => page.locator("img.roi-layer").count()).toBe(2);
-  await page.getByRole("button", { name: "미세조정", exact: true }).click();
+  await page.getByLabel('작업 도구').getByRole("button", { name: "미세조정", exact: true }).click();
   await expect(page.locator(".photo-plane").first()).toHaveCSS(
     "width",
     "1000px",
@@ -334,7 +341,7 @@ test("pending adjustment keeps another photo draft; export stays bound to job re
   await page.getByRole("button", { name: "전체 정합", exact: true }).click();
   await idle(page);
   await select(page, 3);
-  await page.getByRole("button", { name: "미세조정", exact: true }).click();
+  await page.getByLabel('작업 도구').getByRole("button", { name: "미세조정", exact: true }).click();
   await page.locator(".adjustment input[type=number]").first().fill("27");
   await page.locator(".adjustment input[type=number]").first().press("Tab");
   await select(page, 2);
@@ -365,12 +372,13 @@ test("pending adjustment keeps another photo draft; export stays bound to job re
   await expect(
     page.getByRole("button", { name: "목록 비우기", exact: true }),
   ).toBeDisabled();
-  await expect(
-    page.getByRole("button", {
-      name: "목록에서 제거 photo-3.png",
-      exact: true,
-    }),
-  ).toBeDisabled();
+  const removeDuringEdit = page.getByRole("button", {
+    name: "목록에서 제거 photo-3.png",
+    exact: true,
+    includeHidden: true,
+  });
+  await expect(removeDuringEdit).toBeHidden();
+  await expect(removeDuringEdit).toBeDisabled();
 });
 
 test("direct adjustment is uniform and one drag is one undo step", async ({ page }) => {
@@ -378,7 +386,7 @@ test("direct adjustment is uniform and one drag is one undo step", async ({ page
   await select(page, 2);
   await page.getByRole("button", { name: "현재 정합", exact: true }).click();
   await idle(page);
-  await page.getByRole("button", { name: "미세조정", exact: true }).click();
+  await page.getByLabel('작업 도구').getByRole("button", { name: "미세조정", exact: true }).click();
   const frame = page.locator(".adjust-frame");
   const box = (await frame.boundingBox())!;
   const x = page.locator(".adjustment input[type=number]").first();

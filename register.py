@@ -183,10 +183,13 @@ def _run_gate(k0, k1, conf, tooth_area, cfg: PipelineConfig = DEFAULT):
 
 
 def _match_at_level(fixed_L, moving_L, fixed_mask_L, moving_mask_L,
-                    conf_threshold, cfg: PipelineConfig = DEFAULT):
+                    conf_threshold, cfg: PipelineConfig = DEFAULT, global_only=False):
     """Global + Masked LoFTR → 합산 매칭."""
     # Global
     nk0, nk1, ncf = loftr_match(fixed_L, moving_L, conf_threshold=0.1)
+    if global_only or (np.all(fixed_mask_L > 0) and np.all(moving_mask_L > 0)):
+        valid = ncf > conf_threshold
+        return nk0[valid], nk1[valid], ncf[valid]
     # Masked
     f_masked = apply_soft_mask(fixed_L, fixed_mask_L, sigma=cfg.mask_sigma)
     m_masked = apply_soft_mask(moving_L, moving_mask_L, sigma=cfg.mask_sigma)
@@ -211,7 +214,7 @@ def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
                           M_rot_f, crop_off_f, M_rot_m, crop_off_m,
                           fixed_img, moving_img,
                           anchor_f_crop, anchor_m_crop,
-                          cfg: PipelineConfig = DEFAULT):
+                          cfg: PipelineConfig = DEFAULT, correspondences=None):
     """피라미드 L0 실패 시 최고해상 단일 패스 폴백."""
     ms = cfg.pyramid_levels[-1]
     fr, sf = resize_to_max(fc_clahe, ms)
@@ -223,7 +226,12 @@ def _single_pass_fallback(fc_clahe, mc_clahe, fmc, mmc,
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     tooth_area = float(np.sum(cv2.erode(fm, kernel) > 0))
 
-    k0, k1, conf = _match_at_level(fr, mr, fm, mm, cfg.pyramid_conf, cfg=cfg)
+    k0, k1, conf = _match_at_level(fr, mr, fm, mm, cfg.pyramid_conf, cfg=cfg,
+                                 global_only=correspondences is not None)
+    if correspondences is not None:
+        from regional_matching import collect_level
+        collect_level(correspondences, k0, k1, conf, sf, sm, np.eye(3),
+                      M_rot_f, crop_off_f, M_rot_m, crop_off_m)
     n = len(k0)
     print(f"[Fallback {ms}] {n} matches")
 
@@ -290,7 +298,22 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
                   fixed_mask: np.ndarray,
                   moving_mask: np.ndarray,
                   anchor_points: list[tuple] | None = None,
-                  cfg: PipelineConfig = DEFAULT) -> list[dict]:
+                  cfg: PipelineConfig = DEFAULT, *, _regional_budget=None) -> list[dict]:
+    """Default registration, with automatic regional refinement when unmasked."""
+    automatic = (cfg.unmasked_refinement and not anchor_points
+                 and np.all(fixed_mask > 0) and np.all(moving_mask > 0))
+    bank = [] if automatic else None
+    results = _register_pyramid(fixed_img, moving_img, fixed_mask, moving_mask,
+                                anchor_points, cfg, correspondences=bank)
+    if automatic:
+        from regional_matching import refine_result
+        results[0] = refine_result(fixed_img, moving_img, results[0], bank, cfg,
+                                   match_fn=loftr_match, budget=_regional_budget)
+    return results
+
+
+def _register_pyramid(fixed_img, moving_img, fixed_mask, moving_mask,
+                      anchor_points=None, cfg=DEFAULT, correspondences=None):
     """다단계 피라미드 정합 (기본 320→480→640).
 
     Args:
@@ -370,8 +393,8 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
             target_moving = cv2.warpAffine(
                 moving_L, M_scaled[:2, :], (w_f, h_f),
                 borderMode=cv2.BORDER_CONSTANT, borderValue=127)
-            # Pre-aligned → moving is in fixed coords → use fixed mask
-            target_mmask = fmask_L
+            target_mmask = cv2.warpAffine(
+                mmask_L, M_scaled[:2, :], (w_f, h_f), flags=cv2.INTER_NEAREST)
         else:
             target_moving = moving_L
             target_mmask = mmask_L
@@ -380,7 +403,11 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
         # LoFTR: global + masked 합산
         k0, k1, conf = _match_at_level(
             fixed_L, target_moving, fmask_L, target_mmask,
-            cfg.pyramid_conf, cfg=cfg)
+            cfg.pyramid_conf, cfg=cfg, global_only=correspondences is not None)
+        if correspondences is not None:
+            from regional_matching import collect_level
+            collect_level(correspondences, k0, k1, conf, sf, sm, M_scaled,
+                          M_rot_f, crop_off_f, M_rot_m, crop_off_m)
         n = len(k0)
         print(f"[Pyramid L{li}] {n} matches")
 
@@ -392,7 +419,7 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
                     fc_clahe, mc_clahe, fmc, mmc,
                     M_rot_f, crop_off_f, M_rot_m, crop_off_m,
                     fixed_img, moving_img,
-                    anchor_f_crop, anchor_m_crop, cfg=cfg)]
+                    anchor_f_crop, anchor_m_crop, cfg=cfg, correspondences=correspondences)]
             break  # 이전 레벨 결과 사용
 
         # RANSAC + quality gate
@@ -407,7 +434,7 @@ def register_test(fixed_img: np.ndarray, moving_img: np.ndarray,
                     fc_clahe, mc_clahe, fmc, mmc,
                     M_rot_f, crop_off_f, M_rot_m, crop_off_m,
                     fixed_img, moving_img,
-                    anchor_f_crop, anchor_m_crop, cfg=cfg)]
+                    anchor_f_crop, anchor_m_crop, cfg=cfg, correspondences=correspondences)]
             break
 
         # Compose: M_level = M_delta @ M_scaled
@@ -655,6 +682,8 @@ def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
     best_score = (-1, -1)
     best_label = None
     attempts = []
+    from sliding_windows import SearchBudget
+    regional_budget = SearchBudget()
 
     for cur, (pre_score, flip, k, label) in enumerate(ranked, start=1):
         if progress_callback is not None:
@@ -674,7 +703,7 @@ def register_test_lazy(fixed_img: np.ndarray, moving_img: np.ndarray,
         try:
             results = register_test(
                 fixed_img, m_t, fixed_mask, mmask_t,
-                anchor_points=anchors_t, cfg=cfg)
+                anchor_points=anchors_t, cfg=cfg, _regional_budget=regional_budget)
         except Exception as e:
             print(f"[Lazy] {label} 실패: {e}")
             continue

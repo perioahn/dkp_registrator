@@ -1,6 +1,7 @@
 ﻿# 모던 폴더 선택 대화상자 (탐색기 스타일, IFileOpenDialog + FOS_PICKFOLDERS).
 # 실패 시 구형 FolderBrowserDialog 폴백. 선택 경로를 stdout으로 출력, 취소 = 출력 없음.
 param([string]$Initial = "")
+$ErrorActionPreference = 'Stop'
 
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
@@ -59,6 +60,8 @@ public static class ModernFolderPicker {
     private const uint FOS_PICKFOLDERS = 0x20;
     private const uint FOS_FORCEFILESYSTEM = 0x40;
     private const uint SIGDN_FILESYSPATH = 0x80058000;
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
 
     public static string Pick(string title, string initial) {
         var dlg = (IFileDialog)new FileOpenDialogRCW();
@@ -72,7 +75,7 @@ public static class ModernFolderPicker {
                 dlg.SetFolder(item);
             } catch { }
         }
-        if (dlg.Show(IntPtr.Zero) != 0) return null; // 취소
+        if (dlg.Show(GetForegroundWindow()) != 0) return null; // 취소
         IShellItem result;
         dlg.GetResult(out result);
         string path;

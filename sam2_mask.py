@@ -65,13 +65,8 @@ def load_sam2_predictor(
     """
     global _sam2_predictor
     if _sam2_predictor is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif getattr(torch.backends, "mps", None) is not None \
-                and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        from compute_device import current
+        device = current()
         try:
             _sam2_predictor = SAM2ImagePredictor.from_pretrained(
                 model_name,

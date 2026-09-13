@@ -1,17 +1,19 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { buildLUT, orientedSize, renderOriented, type Edits } from '../photoEdits'
-interface Photo { id: string; name: string; file: File }
+import { getPreview } from '../preview'
 
 const props = defineProps<{
-  photo: Photo
+  photo: {id: string; file: File; sourceWidth?: number; sourceHeight?: number}
   edits: Edits
   mode: 'view' | 'crop'
   cropRatio: number | null // 크롭모드 비율 강제 (null=자유)
   straighten: boolean
   showOriginal: boolean
 }>()
-const emit = defineEmits<{ angle: [deg: number]; fineDeg: [deg: number]; error: [message: string] }>()
+const previewLoading = ref(true)
+const previewError = ref('')
+const emit = defineEmits<{ busy: [value:boolean]; ready: []; angle: [deg: number]; fineDeg: [deg: number]; error: [message: string] }>()
 
 const canvasEl = ref<HTMLCanvasElement | null>(null)
 const rootEl = ref<HTMLDivElement | null>(null)
@@ -49,7 +51,6 @@ function updateCursor(p: { x: number; y: number }) {
 let bmp: ImageBitmap | null = null
 let naturalW = 0
 let naturalH = 0
-const PREVIEW_MAX = 1600
 
 // ── 좌표 수학: oriented(θ) ↔ 원본(rot90/flip 후) ──
 // renderOriented는 중심 회전 + 외접 확장이므로:
@@ -98,30 +99,25 @@ function fullScale() {
 
 async function loadPreview() {
   const revision = ++loadRevision
+  previewLoading.value = true; previewError.value = ''
+  emit('busy',true)
+  bmp?.close(); bmp = null
+  if(canvasEl.value) canvasEl.value.width = 0
   try {
-  const full = await createImageBitmap(props.photo.file, { imageOrientation: 'from-image' })
-  if (revision !== loadRevision || disposed) { full.close(); return }
-  bmp?.close()
-  naturalW = full.width
-  naturalH = full.height
-  const s = PREVIEW_MAX / Math.max(full.width, full.height)
-  if (s < 1) {
-    const resized = await createImageBitmap(full, {
-      resizeWidth: Math.round(full.width * s),
-      resizeHeight: Math.round(full.height * s),
-    })
-    full.close()
-    if (revision !== loadRevision || disposed) { resized.close(); return }
-    bmp = resized
-  } else {
-    bmp = full
-  }
+  const asset = await getPreview(props.photo.file)
+  if (revision !== loadRevision || disposed) return
+  const decoded = await createImageBitmap(asset.preview, { imageOrientation: 'from-image' })
+  if (revision !== loadRevision || disposed) { decoded.close(); return }
+  bmp = decoded
+  naturalW = props.photo.sourceWidth ?? asset.width
+  naturalH = props.photo.sourceHeight ?? asset.height
   baseKey = '' // 사진 교체 → 베이스 캐시 무효화
   baseCanvas = null
   fitView()
   syncRectFromEdits()
   render()
-  } catch (error: any) { emit('error', error.message ?? '사진을 표시하지 못했습니다.') }
+  previewLoading.value = false; emit('busy',false); emit('ready')
+  } catch (error: any) { if (revision === loadRevision && !disposed) { previewLoading.value = false; emit('busy',false); previewError.value = error.message ?? '사진을 표시하지 못했습니다.'; emit('error', previewError.value) } }
 }
 
 // oriented 베이스 캐시: 기하(rot90/flip/fine)가 같으면 회전 재계산·픽셀 재독출 생략
@@ -136,8 +132,8 @@ function orientedBase(): HTMLCanvasElement {
   const key = `${e.rot90}|${e.flipH}|${e.flipV}|${e.fineDeg}`
   if (!baseCanvas || key !== baseKey) {
     baseCanvas = renderOriented(bmp!, { ...e, crop: null })
-    baseData = baseCanvas.getContext('2d')!.getImageData(0, 0, baseCanvas.width, baseCanvas.height)
-    outData = new ImageData(baseCanvas.width, baseCanvas.height)
+    baseData = null
+    outData = null
     baseKey = key
   }
   return baseCanvas
@@ -149,10 +145,12 @@ function render() {
   const e = props.edits
   const c = orientedBase() // 크롭은 오버레이로 표현 — 바깥이 계속 보이도록
   const cv = canvasEl.value
-  cv.width = c.width
-  cv.height = c.height
+  if(cv.width !== c.width) cv.width = c.width
+  if(cv.height !== c.height) cv.height = c.height
   const g = cv.getContext('2d')!
   if (!props.showOriginal && (e.brightness !== 0 || e.contrast !== 0)) {
+    if(!baseData) baseData = c.getContext('2d')!.getImageData(0,0,c.width,c.height)
+    if(!outData) outData = new ImageData(c.width,c.height)
     const lut = buildLUT(e.brightness, e.contrast)
     const s = baseData!.data
     const d = outData!.data
@@ -423,11 +421,11 @@ function fitView() {
 // rAF 스로틀 재렌더
 let rafPending = false
 function renderThrottled() {
-  if (rafPending) return
+  if (rafPending || disposed) return
   rafPending = true
   requestAnimationFrame(() => {
     rafPending = false
-    render()
+    if (!disposed) render()
   })
 }
 
@@ -467,7 +465,7 @@ function handlePos(h: string) {
 <template>
   <div
     ref="rootEl" tabindex="0" aria-label="사진 편집 캔버스"
-    class="editor-canvas"
+    class="editor-canvas" :aria-busy="previewLoading"
     :class="{ straighten, cropmode: mode === 'crop' }"
     :style="cursor ? { cursor } : {}"
     @wheel="onWheel"
@@ -477,7 +475,8 @@ function handlePos(h: string) {
     @keyup="(e) => { if (e.code === 'Space') space = false }"
     @blur="space = false"
   >
-    <div class="stage" :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoom})` }">
+    <div v-if="previewLoading || previewError" class="preview-state" role="status">{{ previewError || '미리보기 준비 중…' }}<button v-if="previewError" @click.stop="loadPreview">다시 시도</button></div>
+    <div class="stage" v-show="!previewLoading && !previewError" :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoom})` }">
       <div class="canvas-holder">
         <canvas ref="canvasEl" :style="{ maxWidth: `${available.w}px`, maxHeight: `${available.h}px` }" />
         <svg v-if="mode === 'crop' && canvasEl" class="crop-overlay"
@@ -515,6 +514,7 @@ function handlePos(h: string) {
 
 <style scoped>
 .editor-canvas { width:100%;height:100%;overflow:hidden;position:relative;cursor:grab;outline:none;min-height:150px; }
+.preview-state { position:absolute;inset:0;display:flex;gap:12px;align-items:center;justify-content:center;color:#b5c0cd;font-size:13px }
 .editor-canvas:focus-visible { outline:2px solid #63a9ef;outline-offset:-2px }
 .stage { width:100%;height:100%;display:flex;align-items:center;justify-content:center;transform-origin:center }
 .canvas-holder { position:relative;display:flex;flex-shrink:0 }

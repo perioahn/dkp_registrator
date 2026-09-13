@@ -26,12 +26,13 @@ def client(tmp_path, monkeypatch):
         st = s._mask_state(i)
         st["current"] = np.ones(s.get_work(i).shape[:2], dtype=bool)
     monkeypatch.setattr(s, "_predict_mask", predict)
+    monkeypatch.setattr(s, '_infer_mask', lambda i, work, points, key: np.ones(work.shape[:2], dtype=bool))
     return TestClient(s.app, base_url="http://localhost")
 
 
-def add(c, n=3):
+def add(c, n=3, prefix=''):
     a = np.arange(80 * 100 * 3, dtype=np.uint8).reshape(80, 100, 3)
-    r = c.post("/api/upload", files=[("files", (f"{i}.png", png(a), "image/png")) for i in range(n)])
+    r = c.post("/api/upload", files=[("files", (f"{prefix}{i}.png", png(a), "image/png")) for i in range(n)])
     assert r.status_code == 200, r.text
     return r.json()["ids"]
 
@@ -42,6 +43,23 @@ def test_import_session_preserves_existing_directory(tmp_path):
     (old / "keep.txt").write_text("keep")
     s.Session(str(tmp_path))
     assert (old / "keep.txt").read_text() == "keep"
+
+
+def test_repeated_import_skips_same_file_but_accepts_changed_content(client):
+    first = png(np.zeros((30,40,3),np.uint8))
+    changed = png(np.full((30,40,3),200,np.uint8))
+    response = client.post('/api/upload',files=[('files',('same.png',first,'image/png'))]*2).json()
+    assert len(response['ids']) == 1
+    assert len(response['skipped']) == 1
+    before = client.get('/api/state').json()
+    again = client.post('/api/upload',files=[('files',('same.png',first,'image/png'))]).json()
+    assert again['ids'] == [] and len(again['skipped']) == 1
+    assert client.get('/api/state').json()['revision'] == before['revision']
+    different = client.post('/api/upload',files=[('files',('same.png',changed,'image/png'))]).json()
+    assert len(different['ids']) == 1
+    client.post(f"/api/image/{response['ids'][0]}/delete")
+    readded = client.post('/api/upload',files=[('files',('same.png',first,'image/png'))]).json()
+    assert len(readded['ids']) == 1
 
 
 def test_mask_failure_is_actionable_and_keeps_state(client, monkeypatch):
@@ -287,7 +305,7 @@ def test_roi_preserves_original_resolution_and_bounds(client):
 def test_history_does_not_remove_later_uploaded_photo(client):
     a, b, _ = add(client)
     client.post(f"/api/mask/{a}/click", json={"x": 3, "y": 4, "label": 1})
-    extra = add(client, 1)[0]
+    extra = add(client, 1, prefix='later-')[0]
     client.post("/api/history/undo")
     assert extra in s.SESSION.images
     assert s._union_mask(a) is None

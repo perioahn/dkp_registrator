@@ -20,6 +20,10 @@ export interface ResultInfo {
   freshness: string;
   review_status: string;
   latest_attempt_failed?: boolean;
+  latest_attempt_reason?: string;
+  reference_conflict?: boolean;
+  validation?: string;
+  reference_groups?: {group: string; count: number; max_error: number}[];
   manual_adjusted?: boolean;
   used_mask?: boolean;
   has_previous?: boolean;
@@ -64,6 +68,8 @@ export interface Anchor {
   moving: Point;
   enabled: boolean;
   requested_enabled?: boolean;
+  source?: "manual" | "automatic";
+  group?: string;
 }
 export interface LocalJob {
   id: string;

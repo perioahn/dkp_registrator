@@ -41,6 +41,11 @@ class PipelineConfig:
     mask_sigma: int = 5
     ransac_thresh: float = 3.0
     min_matches: int = 4
+    # No-mask automatic refinement: one bounded round after the global pyramid.
+    unmasked_refinement: bool = True
+    regional_max_crops: int = 6
+    regional_max_side: int = 640
+    regional_budget_seconds: float = 6.0  # checked between inference calls
     # False = similarity만 사용 (비등방 스케일·전단 금지 — 비율 보존).
     # 같은 악궁을 두 번 찍은 사진의 실제 관계는 similarity(회전+등방배율+평행이동)다.
     # affine은 전단·비등방 배율을 허용해 매칭이 나쁠 때 "억지로 맞춘" 왜곡 결과를 낸다

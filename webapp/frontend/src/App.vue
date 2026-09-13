@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import Workspace from "./components/Workspace.vue";
 import FixedEditor from "./components/FixedEditor.vue";
+import { prefetchEditorPreview } from "./editorPreview";
 import {
   api,
   preferredResult,
@@ -16,6 +17,7 @@ import {
 
 const photos = ref<Photo[]>([]),
   appVersion = ref(""),
+  recoveryAvailable = ref(false),
   fixedId = ref<string | null>(null),
   activeId = ref<string | null>(null),
   checked = ref(new Set<string>()),
@@ -24,16 +26,18 @@ const running = ref(false),
   starting = ref(false),
   uploading = ref(false),
   mutating = ref(false),
+  recoveryBusy = ref(false),
   message = ref("사진을 추가하면 첫 사진이 기준이 됩니다."),
   error = ref("");
 const tool = ref<Tool>("compare"),
   mode = ref<ComparisonMode>("side"),
   inspector = ref(true),
+  focused = ref(false),
+  connectionLost = ref(false),
   listSide = ref(localStorage.getItem("dkp-list-side") === "true"),
   search = ref(""),
   filter = ref("all");
 const history = ref({ undo_label: "", redo_label: "" }),
-  profile = ref("normal"),
   lazy = ref(false),
   job = ref<any>(null),
   localJob = ref<LocalJob | null>(null),
@@ -42,6 +46,19 @@ const fileInput = ref<HTMLInputElement>(),
   workspace = ref<InstanceType<typeof Workspace>>(),
   surface = ref<HTMLElement>(),
   gpu = ref<any>(null);
+const saving = ref(false), selectingFolder = ref(false), switchingDevice = ref(false);
+const exportMode = ref('download'), saveDir = ref(''), exportNotice = ref('');
+const cpuHelp = computed(() => {
+  if (gpu.value?.mode === 'cpu' && gpu.value?.accelerator)
+    return '테스트를 위해 CPU를 사용 중입니다. 아래 GPU 가속 버튼으로 복귀할 수 있습니다.';
+  if (gpu.value?.platform === 'darwin')
+    return 'Metal 가속을 사용할 수 없는 환경입니다. macOS와 앱 업데이트를 확인하세요. 지원되지 않는 Mac에서는 CPU로 계속 사용할 수 있습니다.';
+  if (gpu.value?.gpu_name)
+    return gpu.value?.frozen && !gpu.value?.installed
+      ? 'NVIDIA GPU가 감지됐습니다. GPU 가속을 설치한 뒤 앱을 다시 실행하세요. 다운로드가 필요합니다.'
+      : 'NVIDIA 드라이버와 CUDA 지원 실행 환경을 확인한 뒤 앱을 다시 실행하세요. 지금은 CPU로 사용할 수 있습니다.';
+  return 'GPU 가속이 감지되지 않았습니다. NVIDIA GPU가 있는 PC라면 그래픽 드라이버와 GPU 가속 설치 상태를 확인한 뒤 앱을 다시 실행하세요. 그 외에는 CPU로 계속 사용할 수 있으며 계산이 더 오래 걸릴 수 있습니다.';
+});
 let navigation = 0,
   requestSequence = 0,
   appliedSequence = 0,
@@ -51,20 +68,82 @@ let navigation = 0,
 const fixed = computed(
   () => photos.value.find((i) => i.id === fixedId.value) ?? null,
 );
+watch(
+  () => fixed.value && `${fixed.value.id}:${fixed.value.revision}`,
+  () => {
+    if (fixed.value) prefetchEditorPreview(fixed.value);
+  },
+);
 const active = computed(
   () => photos.value.find((i) => i.id === activeId.value) ?? null,
 );
 const photoNames = new Intl.Collator('ko', {numeric: true, sensitivity: 'base'});
-const orderedPhotos = computed(() => [...photos.value].sort((a,b) => photoNames.compare(a.name,b.name)));
+const photoOrder = ref<string[]>((() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem('dkp-photo-order') ?? '[]');
+    return Array.isArray(saved) ? saved.filter(id => typeof id === 'string') : [];
+  } catch { return []; }
+})());
+const orderedPhotos = computed(() => {
+  const ranks = new Map(photoOrder.value.map((id,i) => [id,i]));
+  return [...photos.value].sort((a,b) =>
+    (ranks.get(a.id) ?? Infinity) - (ranks.get(b.id) ?? Infinity) || photoNames.compare(a.name,b.name));
+});
+watch(photoOrder, ids => localStorage.setItem('dkp-photo-order',JSON.stringify(ids)));
 const fixedDropActive = ref(false);
+const draggingPhoto = ref<string | null>(null);
+const insertion = ref<{id: string; after: boolean} | null>(null);
 function dragPhoto(e: DragEvent, id: string) {
+  e.dataTransfer?.clearData();
   e.dataTransfer?.setData('application/x-dkp-photo', id);
   if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  draggingPhoto.value = id;
+}
+function endPhotoDrag() {
+  draggingPhoto.value = null;
+  insertion.value = null;
+  fixedDropActive.value = false;
+}
+function previewOrder(e: DragEvent, id: string) {
+  if (!draggingPhoto.value) {
+    if (Array.from(e.dataTransfer?.types ?? []).includes('Files')) e.preventDefault();
+    return;
+  }
+  if (draggingPhoto.value === id || tool.value === 'edit') return;
+  e.preventDefault();
+  const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  insertion.value = {id, after: listSide.value ? e.clientY > box.y+box.height/2 : e.clientX > box.x+box.width/2};
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+}
+function dropPhoto(e: DragEvent, id: string) {
+  const source = e.dataTransfer?.getData('application/x-dkp-photo');
+  if (!source) { dropFiles(e); return; }
+  if (tool.value !== 'edit' && source !== id && photos.value.some(p => p.id === source)) {
+    const ids = orderedPhotos.value.map(p => p.id).filter(p => p !== source);
+    const at = ids.indexOf(id);
+    if (at >= 0) {
+      ids.splice(at + (insertion.value?.id === id && insertion.value.after ? 1 : 0),0,source);
+      photoOrder.value = ids;
+      reviewQueue = [];
+      message.value = '사진 순서를 변경했습니다.';
+    }
+  }
+  endPhotoDrag();
+}
+function dropFiles(e: DragEvent) {
+  const types = Array.from(e.dataTransfer?.types ?? []);
+  if (draggingPhoto.value || types.some(t => ['application/x-dkp-photo','text/uri-list','text/html'].includes(t))) return;
+  upload(e.dataTransfer?.files ?? null);
+}
+function guardNativeDrag(e: DragEvent) {
+  if (!(e.target as HTMLElement).closest('.photo-card')) e.preventDefault();
 }
 function dropFixed(e: DragEvent) {
   fixedDropActive.value = false;
   const id = e.dataTransfer?.getData('application/x-dkp-photo');
   if (id && photos.value.some(p => p.id === id)) changeFixed(id);
+  else if (!id) dropFiles(e);
+  endPhotoDrag();
 }
 const moving = computed(() =>
   orderedPhotos.value.filter((i) => i.id !== fixedId.value),
@@ -119,6 +198,7 @@ const canRun = computed(
     !starting.value &&
     !mutating.value &&
     !uploading.value &&
+    !recoveryBusy.value &&
     moving.value.length > 0,
 );
 const currentIsMoving = computed(
@@ -134,7 +214,7 @@ const reviewable = computed(
 );
 const toolNames: { key: Tool; name: string }[] = [
   { key: "compare", name: "비교" },
-  { key: "mask", name: "점·마스크" },
+  { key: "mask", name: "마스크" },
   { key: "adjust", name: "미세조정" },
 ];
 const modeNames: { key: ComparisonMode; name: string }[] = [
@@ -151,15 +231,29 @@ watch([search, filter], () => {
 function report(e: any) {
   error.value = e?.message ?? String(e);
 }
-async function refresh() {
+let refreshFlight: Promise<void> | null = null;
+let refreshQueued = false;
+function refresh(): Promise<void> {
+  refreshQueued = true;
+  if (refreshFlight) return refreshFlight;
+  refreshFlight = (async () => {
+    do {
+      refreshQueued = false;
+      await refreshState();
+    } while (refreshQueued);
+  })().finally(() => { refreshFlight = null; });
+  return refreshFlight;
+}
+async function refreshState() {
   const seq = ++requestSequence;
   try {
     const d = await api("/api/state");
     if (seq < appliedSequence) return;
     appliedSequence = seq;
-    const oldFixed = fixedId.value;
     photos.value = d.images;
+    photoOrder.value = photoOrder.value.filter(id => d.images.some((p: Photo) => p.id === id));
     appVersion.value = d.version ?? "구버전 서버";
+    recoveryAvailable.value = !!d.capabilities?.anchor_recovery;
     revision.value = d.revision ?? 0;
     running.value = d.running;
     fixedId.value =
@@ -183,6 +277,17 @@ async function refresh() {
 function focusCanvas() {
   nextTick(() => surface.value?.focus());
 }
+function toggleFocus() {
+  focused.value = !focused.value;
+  focusCanvas();
+}
+function exitFocus(e: KeyboardEvent) {
+  if (focused.value && e.code === 'Escape' && !e.isComposing && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    focused.value = false;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}
 function select(id: string, user = true) {
   if (user) {
     navigation++;
@@ -194,6 +299,7 @@ function select(id: string, user = true) {
 }
 function chooseTool(value: Tool) {
   navigation++;
+  error.value = '';
   tool.value = value;
   focusCanvas();
 }
@@ -220,6 +326,7 @@ async function upload(files: FileList | File[] | null) {
     await refresh();
     const bad = d.rejected ?? [];
     message.value = `${d.ids?.length ?? files.length}장 추가 · 기준: ${fixed.value?.name ?? ""}`;
+    if (d.skipped?.length) message.value += ` · 이미 불러온 사진 ${d.skipped.length}장 건너뜀`;
     if (bad.length)
       error.value = `제외된 파일: ${bad.map((p: any) => (typeof p === "string" ? p : (p.name ?? p.filename))).join(", ")}`;
   } catch (e) {
@@ -276,8 +383,9 @@ async function clearAll() {
   }
 }
 let historyQueue: Promise<void> = Promise.resolve();
-function undo(redo = false) {
+async function undo(redo = false) {
   if (running.value || tool.value === "edit") return;
+  await workspace.value?.settleMaskAction();
   if (tool.value === "adjust" && workspace.value?.draftUndo(redo)) return;
   if (!redo && workspace.value?.cancelInput()) return;
   historyQueue = historyQueue.then(() => performUndo(redo));
@@ -297,7 +405,7 @@ async function performUndo(redo: boolean) {
     mutating.value = false;
   }
 }
-async function run(ids: string[]) {
+async function run(ids: string[], recovery?: {fixedId: string; revision: number}) {
   if (!canRun.value || !ids.length) return;
   const targets = [...ids],
     jobFixedId = fixedId.value!,
@@ -309,8 +417,11 @@ async function run(ids: string[]) {
   try {
     const d = await api("/api/register", {
       only: targets,
-      profile: profile.value,
+      profile: 'normal',
       lazy: lazy.value,
+      anchor_only: !!recovery,
+      expected_fixed: recovery?.fixedId,
+      expected_anchor_revision: recovery?.revision,
     });
     localJob.value = {
       id: d.job_id,
@@ -337,6 +448,7 @@ async function handleDone(d: any) {
     return;
   }
   await refresh();
+  void refreshGpu();
   const finished = localJob.value;
   if (!finished || finished.id !== d.job_id) return;
   const next = completionSelection(
@@ -379,25 +491,55 @@ async function stop() {
   }
 }
 async function save(ids: string[]) {
-  if (!ids.length) return;
+  if (!ids.length || saving.value) return;
   const expected_fixed_id = fixedId.value;
   const expected_results = Object.fromEntries(
     ids.map((id) => [id, photos.value.find((p) => p.id === id)?.result?.id]),
   );
+  saving.value = true;
+  error.value = '';
+  exportNotice.value = `${ids.length}장 저장 파일을 준비하고 있습니다…`;
   try {
-    const selected = await api("/api/select_folder", {});
-    if (!selected.path) return;
-    const d = await api("/api/save_results", {
-      dir: selected.path,
-      only: ids,
-      expected_fixed_id,
-      expected_results,
-    });
-    message.value = `${d.saved}장 저장 완료 · ${d.dir}`;
-    if (d.failed?.length) error.value = `${d.failed.length}장 저장 실패`;
+    const body = {only:ids, expected_fixed_id, expected_results};
+    if (exportMode.value === 'folder') {
+      if (!saveDir.value.trim()) throw Error('저장할 폴더 경로를 입력하거나 폴더 찾기를 눌러 주세요.');
+      const d = await api('/api/save_results', {...body, dir:saveDir.value.trim()});
+      exportNotice.value = `${d.saved}장 저장 완료 · ${d.dir}`;
+      if (d.failed?.length) throw Error(`${d.saved}장 저장 · ${d.failed.length}장 실패: ${d.failed.join(', ')}`);
+    } else {
+      const response = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+      if (!response.ok) {
+        const d = await response.json().catch(() => ({}));
+        throw Error(d.detail || '파일을 준비하지 못했습니다. 다시 시도하세요.');
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const filename = response.headers.get('Content-Disposition')?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+      link.download = filename ? decodeURIComponent(filename) : (ids.length === 1 ? 'DKP-정합결과.jpg' : 'DKP-정합결과.zip');
+      document.body.appendChild(link); link.click(); link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+      exportNotice.value = '다운로드를 요청했습니다. 브라우저 다운로드 목록에서 파일을 확인하세요.';
+    }
+    message.value = exportNotice.value;
   } catch (e) {
+    exportNotice.value = e instanceof Error ? e.message : '저장하지 못했습니다.';
     report(e);
+  } finally {
+    saving.value = false;
   }
+}
+async function chooseSaveFolder() {
+  if (selectingFolder.value) return;
+  selectingFolder.value = true;
+  exportNotice.value = '폴더 선택창을 열고 있습니다. 창이 보이지 않으면 경로를 직접 입력하거나 파일 다운로드를 선택하세요.';
+  try {
+    const selected = await api('/api/select_folder', {});
+    if (selected.path) {saveDir.value = selected.path; exportNotice.value = `저장 폴더: ${selected.path}`;}
+    else exportNotice.value = '폴더 선택을 취소했습니다.';
+  } catch (e:any) {exportNotice.value = e.message;}
+  finally {selectingFolder.value = false;}
 }
 async function review(status: string, advance = false) {
   if (!reviewable.value || !active.value) return;
@@ -445,13 +587,21 @@ function keys(e: KeyboardEvent) {
     (e.target as HTMLElement)?.closest(
       'input,textarea,select,[contenteditable="true"]',
     ) !== null;
+  if (!editing && !e.isComposing && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === 'KeyF') {
+    e.preventDefault();
+    toggleFocus();
+    return;
+  }
   const action = shortcut(e, tool.value, editing);
   if (!action) return;
   e.preventDefault();
   if (action === "undo" || action === "redo") undo(action === "redo");
   else if (action === "anchor") workspace.value?.startAnchor();
   else if (action === "delete-anchor") workspace.value?.deleteAnchor();
-  else if (action === "cancel") workspace.value?.cancel();
+  else if (action === "cancel") {
+    if (focused.value) focused.value = false;
+    else workspace.value?.cancel();
+  }
   else if (action === "confirm" || action === "reset-mask")
     workspace.value?.maskAction(action === "confirm" ? "confirm" : "reset");
   else if (action === "fit") workspace.value?.fit();
@@ -489,6 +639,15 @@ async function refreshGpu() {
     gpu.value = await api("/api/gpu");
   } catch {}
 }
+async function switchDevice(mode: 'auto' | 'cpu') {
+  if (switchingDevice.value) return;
+  switchingDevice.value = true;
+  try {
+    gpu.value = await api('/api/gpu/device', {mode});
+    message.value = `${mode === 'cpu' ? 'CPU로' : 'GPU 가속으로'} 전환했습니다. 다음 계산부터 적용됩니다.`;
+  } catch (e) {report(e);}
+  finally {switchingDevice.value = false;}
+}
 async function installGpu() {
   if (
     !confirm(
@@ -508,6 +667,11 @@ onMounted(() => {
   refreshGpu();
   window.addEventListener("focus", refresh);
   eventSource = new EventSource("/api/events");
+  eventSource.onerror = () => { connectionLost.value = true; };
+  eventSource.onopen = () => {
+    if (connectionLost.value) refresh();
+    connectionLost.value = false;
+  };
   eventSource.addEventListener("register", (event) => {
     const d = JSON.parse((event as MessageEvent).data);
     if (d.state === "done") handleDone(d);
@@ -532,13 +696,15 @@ onUnmounted(() => {
 <template>
   <div
     class="app"
-    :class="{ 'list-side': listSide, 'inspector-hidden': !inspector }"
+    @keydown.capture="exitFocus"
+    :class="{ 'list-side': listSide, 'inspector-hidden': !inspector, 'focus-mode': focused, 'editing-photo': tool === 'edit' }"
     @dragover.prevent
-    @drop.prevent="upload($event.dataTransfer?.files ?? null)"
+    @drop.prevent="dropFiles"
+    @dragstart.capture="guardNativeDrag"
   >
     <header class="app-header">
       <div class="brand">
-        <b>DKP</b><span>Registrator <small data-testid="app-version">{{ appVersion }} · 임상사진 비교 작업대</small></span>
+        <b>DKP</b><span>Registrator <small data-testid="app-version">{{ appVersion }} · UI 12</small></span>
       </div>
       <button
         class="primary"
@@ -546,6 +712,9 @@ onUnmounted(() => {
         @click="fileInput?.click()"
       >
         {{ uploading ? "불러오는 중…" : "+ 사진 추가" }}
+      </button>
+      <button :disabled="!photos.length || running || uploading || mutating || tool === 'edit'" @click="clearAll">
+        목록 비우기
       </button>
       <input
         ref="fileInput"
@@ -562,7 +731,7 @@ onUnmounted(() => {
         @dragleave="fixedDropActive = false"
         @drop.stop.prevent="dropFixed"
         title="목록의 사진을 이 슬롯에 끌어 놓아 기준 사진을 교체하세요">
-        <img :src="`/api/image/${fixed.id}?v=${fixed.revision}`" alt="" />
+        <img :src="`/api/image/${fixed.id}?v=${fixed.revision}&max_side=256`" decoding="async" draggable="false" alt="" />
         <div class="fixed-slot-copy"><span class="eyebrow">고정 사진 · 끌어 놓아 교체</span>
         <strong :title="fixed.name">{{ fixed.name }}</strong></div
         ><button :disabled="running" @click="editFixed">기준 편집</button>
@@ -586,7 +755,10 @@ onUnmounted(() => {
       >
         ↷
       </button>
-      <button :class="{ on: inspector }" @click="inspector = !inspector">
+      <button :aria-pressed="focused" title="사진 작업 영역 확대 · F / Esc 복귀" @click="toggleFocus">
+        {{ focused ? '집중 보기 종료' : '집중 보기' }} <kbd>F</kbd>
+      </button>
+      <button :class="{ on: inspector && !focused }" @click="focused ? (focused = false, inspector = true) : (inspector = !inspector)">
         정보·저장
       </button>
     </header>
@@ -637,24 +809,6 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
-          <div v-if="result?.latest_attempt_failed" class="notice">
-            이번 정합은 실패했습니다. 아래에는 이전 결과가 표시됩니다.
-            대응점이나 마스크를 보정한 뒤 다시 정합하세요.
-          </div>
-          <div
-            v-else-if="result && result.freshness !== 'current'"
-            class="notice"
-          >
-            입력 사진 또는 보조점이 바뀌었습니다. 이전 결과는 계산 당시 기준으로
-            표시합니다. 새 기준으로 정합해 주세요.
-          </div>
-          <div v-if="result?.status === 'fail'" class="notice failure">
-            정합 실패 ·
-            {{
-              result.reason ||
-              "대응점을 추가하거나 사진 방향 자동탐색을 사용해 보세요."
-            }}
-          </div>
           <FixedEditor
             v-if="tool === 'edit'"
             :image="fixed"
@@ -669,11 +823,15 @@ onUnmounted(() => {
             :current="active"
             :tool="tool"
             :mode="mode"
-            :running="running"
+            :running="running || starting || mutating"
             :revision="revision"
+            :registration-error="error"
+            :recovery-available="recoveryAvailable"
             @changed="refresh"
             @error="report"
             @update:tool="chooseTool"
+            @recovery-busy="recoveryBusy = $event"
+            @recover="({mid, fixedId, revision}) => run([mid], {fixedId, revision})"
           />
         </template>
         <section v-else class="empty-state">
@@ -688,7 +846,7 @@ onUnmounted(() => {
           ><small>JPEG · PNG · 이곳에 파일을 끌어 놓아도 됩니다</small>
         </section>
       </main>
-      <aside v-if="inspector" class="inspector">
+      <aside v-if="inspector" v-show="!focused" class="inspector">
         <div class="inspector-title">
           <strong>작업 정보</strong
           ><button aria-label="정보 패널 닫기" @click="inspector = false">
@@ -743,21 +901,36 @@ onUnmounted(() => {
               <dd>{{ result.reproj_median?.toFixed(2) ?? "—" }} px</dd>
               <dt>변환</dt>
               <dd>회전·이동·균일 배율</dd>
+              <template v-if="result.reference_groups?.length">
+                <dt>앵커 그룹별 최대 오차</dt>
+                <dd v-for="(group, index) in result.reference_groups" :key="group.group">
+                  기준 {{ index + 1 }} · {{ group.max_error.toFixed(1) }} px
+                </dd>
+              </template>
             </dl>
             <small>자동 지표는 검토를 돕는 정보입니다.</small>
           </details>
         </template>
         <section class="inspector-section">
           <h3>내보내기</h3>
+          <label class="wide">저장 방식<select v-model="exportMode" :disabled="saving" aria-label="저장 방식">
+            <option value="download">파일 다운로드</option><option value="folder">폴더에 저장</option>
+          </select></label>
+          <p v-if="exportMode === 'download'" class="subtle">한 장은 JPG, 여러 장은 ZIP으로 다운로드합니다.</p>
+          <div v-else class="export-folder">
+            <input v-model="saveDir" aria-label="저장 폴더 경로" placeholder="저장할 폴더 경로" :disabled="saving" />
+            <button :disabled="selectingFolder || saving" @click="chooseSaveFolder">{{ selectingFolder ? '폴더 선택 대기 중…' : '폴더 찾기' }}</button>
+          </div>
+          <p v-if="exportNotice" class="export-notice" role="status" aria-live="polite">{{ exportNotice }}</p>
           <button
             class="wide"
-            :disabled="!active || !resultIds.includes(active.id)"
+            :disabled="saving || !active || !resultIds.includes(active.id)"
             @click="save([active!.id])"
           >
             현재 결과 저장</button
           ><button
             class="wide"
-            :disabled="!checkedMoving.some((id) => resultIds.includes(id))"
+            :disabled="saving || !checkedMoving.some((id) => resultIds.includes(id))"
             @click="save(checkedMoving.filter((id) => resultIds.includes(id)))"
           >
             선택 결과 저장 ({{
@@ -765,47 +938,54 @@ onUnmounted(() => {
             }})</button
           ><button
             class="wide"
-            :disabled="!confirmedIds.length"
+            :disabled="saving || !confirmedIds.length"
             @click="save(confirmedIds)"
           >
             확인한 결과 저장 ({{ confirmedIds.length }})</button
           ><button
             class="wide"
-            :disabled="!jobSaveIds.length"
+            :disabled="saving || !jobSaveIds.length"
             title="이 작업의 기준과 결과 버전이 유지된 사진만 저장합니다."
             @click="save(jobSaveIds)"
           >
             이번 작업 결과 저장</button
           ><button
             class="wide"
-            :disabled="!resultIds.length"
+            :disabled="saving || !resultIds.length"
             @click="save(resultIds)"
           >
             전체 결과 저장
           </button>
         </section>
-        <details>
+        <details @toggle="($event.target as HTMLDetailsElement).open && refreshGpu()">
           <summary>정합 설정</summary>
-          <label class="wide"
-            >판정 기준<select v-model="profile">
-              <option value="normal">기본</option>
-              <option value="strict">엄격</option>
-            </select></label
-          ><label
+          <label
             ><input type="checkbox" v-model="lazy" />사진 방향 자동탐색</label
           >
           <p class="subtle">
             회전과 반전을 탐색합니다. 모든 결과의 가로세로 비율은 유지됩니다.
           </p>
-          <p v-if="gpu">
-            {{
+          <details v-if="gpu" class="device-disclosure">
+            <summary title="실행 장치 전환 펼치기/접기">
+              <span>{{
               gpu.device === "cuda"
                 ? "NVIDIA GPU 사용"
                 : gpu.device === "mps"
                   ? "Apple Metal 사용"
                   : "CPU 사용"
-            }}
-          </p>
+              }}</span><span class="device-chevron" aria-hidden="true">⌄</span>
+            </summary>
+          <div v-if="gpu?.mode" class="device-test">
+            <strong>실행 장치 전환 <small>(테스트용)</small></strong>
+            <div>
+              <button :aria-pressed="gpu.mode === 'auto' && gpu.device !== 'cpu'" :disabled="switchingDevice || running || starting || recoveryBusy || gpu.installing || !gpu.accelerator" @click="switchDevice('auto')">GPU 가속</button>
+              <button :aria-pressed="gpu.device === 'cpu'" :disabled="switchingDevice || running || starting || recoveryBusy || gpu.installing" @click="switchDevice('cpu')">CPU</button>
+            </div>
+            <p class="subtle">{{ switchingDevice ? '장치를 전환하고 있습니다…' : '다음 계산부터 적용됩니다. 전환 후 첫 작업은 모델 준비로 더 걸릴 수 있으며, 앱 재실행 시 자동 선택으로 돌아갑니다.' }}</p>
+            <p v-for="(device, name) in gpu.models" :key="name" class="subtle">{{ name }} 모델: {{ device }}</p>
+          </div>
+          </details>
+          <p v-if="gpu?.device === 'cpu'" class="subtle" data-testid="cpu-help">{{ cpuHelp }}</p>
           <button
             v-if="
               gpu?.gpu_name &&
@@ -825,7 +1005,7 @@ onUnmounted(() => {
           <p>
             Z 마스크 확정 · X 마스크 초기화<br />A 대응점 추가 · D 선택점
             취소<br />Ctrl/Cmd+Z 되돌리기<br />Ctrl/Cmd+Shift+Z 다시 실행<br />0
-            화면 맞춤 · Space+드래그 이동
+            화면 맞춤 · Space+드래그 이동<br />F 집중 보기 · Esc 복귀
           </p>
           <small
             >작업대에 포커스가 있을 때 사용합니다. C는 지정하지
@@ -833,7 +1013,7 @@ onUnmounted(() => {
           >
         </details>
       </aside>
-      <section class="photo-browser" aria-label="사진 목록">
+      <section v-show="!focused" class="photo-browser" aria-label="사진 목록">
         <div class="browser-toolbar">
           <strong>사진 {{ photos.length }}</strong
           ><input
@@ -886,19 +1066,29 @@ onUnmounted(() => {
               active: p.id === activeId,
               reference: p.id === fixedId,
               checked: checked.has(p.id),
+              dragging: draggingPhoto === p.id,
+              'insert-before': insertion?.id === p.id && !insertion.after,
+              'insert-after': insertion?.id === p.id && insertion.after,
             }"
             :data-photo-id="p.id"
             :draggable="tool !== 'edit'"
             @dragstart="dragPhoto($event, p.id)"
+            @dragend="endPhotoDrag"
+            @dragover.stop="previewOrder($event, p.id)"
+            @dragleave="insertion?.id === p.id && (insertion = null)"
+            @drop.stop.prevent="dropPhoto($event, p.id)"
             @click="select(p.id)"
           >
             <button
               class="thumbnail-button"
               :aria-label="`사진 보기 ${p.name}`"
+              title="끌어서 순서 변경 · 상단 고정 슬롯에 놓으면 기준 변경"
             >
               <img
                 loading="lazy"
-                :src="`/api/image/${p.id}?v=${p.revision}`"
+                decoding="async"
+                draggable="false"
+                :src="`/api/image/${p.id}?v=${p.revision}&max_side=256`"
                 :alt="p.name"
               /><span class="photo-index">{{ i + 1 }}</span
               ><span v-if="p.id === fixedId" class="reference-badge"
@@ -964,16 +1154,11 @@ onUnmounted(() => {
           tool = 'compare';
         "
       >
-        최근 결과 보기</button
-      ><button
-        :disabled="!photos.length || running || tool === 'edit'"
-        @click="clearAll"
-      >
-        목록 비우기
-      </button>
+        최근 결과 보기</button>
     </footer>
     <div class="status-bar" role="status" aria-live="polite">
-      <span :class="{ failure: error }">{{ error || message }}</span
+      <span v-if="connectionLost" class="connection-warning">서버 연결이 끊겼습니다 · 자동 재연결 중…</span>
+      <span v-else :class="{ failure: error }">{{ error || message }}</span
       ><button v-if="error" aria-label="오류 메시지 닫기" @click="error = ''">
         ×</button
       ><span class="spacer" /><span class="privacy-note">로컬 사진 처리</span>

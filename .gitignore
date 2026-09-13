@@ -25,6 +25,7 @@ webapp/frontend/node_modules/
 !webapp/frontend/dist/
 !webapp/frontend/dist/**
 .gstack/
+.unlazy/
 
 _tmp_*
 webapp/frontend/test-results/

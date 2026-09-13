@@ -22,26 +22,36 @@ const props = withDefaults(
       disabled?: boolean;
     }[];
     interactive?: boolean;
-    loupe?: boolean;
-    cursorPoint?: { x: number; y: number } | null;
     overlayTransform?: string;
     overlayRegionUrl?: string;
     adjustment?: Adjustment;
   }>(),
-  { opacity: 0.6, points: () => [], interactive: false, loupe: false },
+  { opacity: 0.6, points: () => [], interactive: false },
 );
 const emit = defineEmits<{
   "update:view": [Viewport];
+  "update:wipe": [number];
   point: [{ x: number; y: number; button: number }];
   anchor: [{ id: string; x: number; y: number; end: boolean; moved?: boolean }];
-  hover: [{ x: number; y: number }];
   adjust: [Adjustment, "start" | "move" | "end" | "cancel"];
 }>();
+async function imageLoaded(event: Event) {
+  const img = event.currentTarget as HTMLImageElement;
+  try {
+    await img.decode();
+    if (img.isConnected && img.getAttribute('src') === props.src) loading.value = false;
+  } catch {
+    if (img.isConnected && img.getAttribute('src') === props.src) {
+      error.value = true;
+      loading.value = false;
+    }
+  }
+}
 const host = ref<HTMLElement>(),
   size = ref({ w: 1, h: 1 }),
   space = ref(false),
-  hover = ref({ x: 0, y: 0 }),
-  error = ref(false);
+  error = ref(false),
+  loading = ref(true);
 const fitScale = computed(
   () =>
     Math.min(size.value.w / props.width, size.value.h / props.height) * 0.94,
@@ -53,6 +63,35 @@ const left = computed(
 const top = computed(
   () => size.value.h / 2 - props.view.cy * props.height * scale.value,
 );
+const wipeClip = computed(() => {
+  if (props.wipe === undefined) return undefined;
+  const fraction = (size.value.w * props.wipe / 100 - left.value) / (props.width * scale.value);
+  return `inset(0 ${100 * (1 - Math.max(0, Math.min(1, fraction)))}% 0 0)`;
+});
+let wiping = false;
+function moveWipe(e: PointerEvent) {
+  if (!wiping) return;
+  const x = e.clientX - host.value!.getBoundingClientRect().left;
+  emit('update:wipe', Math.max(0, Math.min(100, x / size.value.w * 100)));
+}
+function startWipe(e: PointerEvent) {
+  if (e.button !== 0) return;
+  wiping = true;
+  const handle = e.currentTarget as HTMLElement;
+  handle.focus();
+  handle.setPointerCapture(e.pointerId);
+  moveWipe(e);
+}
+function keyWipe(e: KeyboardEvent) {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
+  const next = e.code === 'Home' ? 0 : e.code === 'End' ? 100
+    : e.code === 'ArrowLeft' ? (props.wipe ?? 50) - (e.shiftKey ? 10 : 1)
+    : e.code === 'ArrowRight' ? (props.wipe ?? 50) + (e.shiftKey ? 10 : 1) : null;
+  if (next === null) return;
+  e.preventDefault();
+  e.stopPropagation();
+  emit('update:wipe', Math.max(0, Math.min(100, next)));
+}
 const pictureStyle = computed(() => ({
   width: `${props.width}px`,
   height: `${props.height}px`,
@@ -135,8 +174,6 @@ function down(e: PointerEvent) {
 }
 function move(e: PointerEvent) {
   const p = imagePos(e);
-  hover.value = p;
-  emit("hover", p);
   if (!drag) return;
   if (Math.hypot(e.clientX - drag.ox, e.clientY - drag.oy) > 3)
     drag.moved = true;
@@ -223,9 +260,6 @@ function wheel(e: WheelEvent) {
 function fit() {
   emit("update:view", { zoom: 1, cx: 0.5, cy: 0.5 });
 }
-function actual() {
-  emit("update:view", { ...props.view, zoom: 1 / fitScale.value });
-}
 function onKey(e: KeyboardEvent) {
   if (e.code === "Escape" && drag?.adjust) {
     emit("adjust", drag.adjust.start, "cancel");
@@ -278,40 +312,6 @@ function updateROI() {
     if (w > 0 && h > 0) roi.value = { x, y, w, h, url: regionURL(x, y, w, h) };
   }, 100);
 }
-const loupePoint = computed(() => props.cursorPoint ?? hover.value);
-const loupeURL = computed(() =>
-  props.regionUrl
-    ? regionURL(
-        Math.max(
-          0,
-          Math.min(props.width - 200, Math.round(loupePoint.value.x - 100)),
-        ),
-        Math.max(
-          0,
-          Math.min(props.height - 200, Math.round(loupePoint.value.y - 100)),
-        ),
-        Math.min(200, props.width),
-        Math.min(200, props.height),
-      )
-    : "",
-);
-const loupeOverlay = computed(() =>
-  props.overlayRegionUrl
-    ? regionURL(
-        Math.max(
-          0,
-          Math.min(props.width - 200, Math.round(loupePoint.value.x - 100)),
-        ),
-        Math.max(
-          0,
-          Math.min(props.height - 200, Math.round(loupePoint.value.y - 100)),
-        ),
-        Math.min(200, props.width),
-        Math.min(200, props.height),
-        props.overlayRegionUrl,
-      )
-    : "",
-);
 watch(
   [
     () => props.view.zoom,
@@ -326,6 +326,7 @@ watch(
   () => props.src,
   () => {
     error.value = false;
+    loading.value = true;
     updateROI();
   },
 );
@@ -342,7 +343,7 @@ onUnmounted(() => {
   clearTimeout(timer);
   window.removeEventListener("keyup", releaseKey);
 });
-defineExpose({ fit, actual });
+defineExpose({ fit });
 </script>
 <template>
   <div
@@ -351,6 +352,7 @@ defineExpose({ fit, actual });
     :class="{ placing: interactive && !space }"
     tabindex="0"
     :aria-label="label"
+    :aria-busy="loading"
     @wheel.prevent="wheel"
     @pointerdown="down"
     @pointermove="move"
@@ -365,13 +367,17 @@ defineExpose({ fit, actual });
     </div>
     <div class="photo-plane" :style="pictureStyle">
       <img
+        :key="src"
         class="photo-layer"
         :src="src"
         draggable="false"
-        @error="error = true"
+        decoding="async"
+        @load="imageLoaded"
+        @error="error = true; loading = false"
       />
       <img
         v-if="roi"
+        :key="roi.url"
         class="roi-layer"
         :src="roi.url"
         :style="{
@@ -384,13 +390,13 @@ defineExpose({ fit, actual });
       />
       <img
         v-if="overlay"
+        :key="`${src}:${overlay}`"
         class="photo-layer"
         :src="overlay"
         draggable="false"
         :style="{
           opacity,
-          clipPath:
-            wipe === undefined ? undefined : `inset(0 ${100 - wipe}% 0 0)`,
+          clipPath: wipeClip,
           transform: overlayTransform,
         }"
       />
@@ -399,12 +405,12 @@ defineExpose({ fit, actual });
         class="photo-layer"
         :style="{
           opacity,
-          clipPath:
-            wipe === undefined ? undefined : `inset(0 ${100 - wipe}% 0 0)`,
+          clipPath: wipeClip,
           transform: overlayTransform,
         }"
       >
         <img
+          :key="regionURL(roi.x, roi.y, roi.w, roi.h, overlayRegionUrl)"
           class="roi-layer"
           :src="regionURL(roi.x, roi.y, roi.w, roi.h, overlayRegionUrl)"
           :style="{
@@ -460,20 +466,19 @@ defineExpose({ fit, actual });
         {{ p.label }}
       </button>
     </div>
+    <div v-if="wipe !== undefined && overlay" class="wipe-divider" :style="{ left: wipe + '%' }">
+      <button class="wipe-handle" role="slider" aria-label="와이프 경계 이동"
+        aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="Math.round(wipe)"
+        :style="{ transform: `translateX(${wipe < 3 ? 0 : wipe > 97 ? -100 : -50}%)` }"
+        @pointerdown.stop.prevent="startWipe" @pointermove.stop="moveWipe"
+        @pointerup.stop="wiping = false" @pointercancel.stop="wiping = false" @lostpointercapture="wiping = false"
+        @keydown="keyWipe" @dblclick.stop="emit('update:wipe', 50)">
+        <span aria-hidden="true">↔</span>
+      </button>
+    </div>
+    <div v-if="loading" class="viewport-loading" role="status">사진 불러오는 중…</div>
     <div v-if="error" class="viewport-error">
       사진을 불러오지 못했습니다. 다시 선택해 주세요.
-    </div>
-    <div v-if="loupe && regionUrl" class="loupe">
-      <img :src="loupeURL" draggable="false" /><img
-        v-if="loupeOverlay"
-        class="loupe-overlay"
-        :src="loupeOverlay"
-        :style="{
-          opacity,
-          clipPath:
-            wipe === undefined ? undefined : `inset(0 ${100 - wipe}% 0 0)`,
-        }"
-      /><span>원본 부분 확대 · 100%</span>
     </div>
   </div>
 </template>

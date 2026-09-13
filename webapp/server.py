@@ -22,11 +22,12 @@ import hashlib
 import base64
 import socket
 from collections import OrderedDict
+from dataclasses import replace
 
 import cv2
 import numpy as np
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,26 +42,21 @@ for _s in (sys.stdout, sys.stderr):
 from config import PROFILES, get_profile  # noqa: E402
 from register import (  # noqa: E402
     _apply_orientation,
-    false_color,
     register_test,
     register_test_lazy,
 )
+from anchor_recovery import recommend_anchors, register_anchors
 
 log = logging.getLogger(__name__)
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.1-local.12"
 
 SAM2_MAX_SIDE = 1024
 
 
 def _torch_device() -> str:
     """현재 엔진이 쓰는 가속 장치 — /api/state의 device 필드."""
-    import torch
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) is not None \
-            and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    from compute_device import current
+    return current()
 
 
 def data_dir() -> str:
@@ -85,8 +81,24 @@ class Session(WorkspaceSession):
 
 SESSION = Session()
 
-_img_cache: dict[str, np.ndarray] = {}   # id → RGB (SAM2_MAX_SIDE 제한)
+_img_cache: OrderedDict[str, np.ndarray] = OrderedDict()
 _full_cache: OrderedDict[str, np.ndarray] = OrderedDict()  # bounded original-resolution cache
+_FULL_BUDGET = 256 * 1024 * 1024
+_preview_cache: OrderedDict[tuple, bytes] = OrderedDict()
+_PREVIEW_BUDGET = 64 * 1024 * 1024
+_recommend_lock = threading.Lock()
+_recommend_cache: OrderedDict[str, dict] = OrderedDict()
+
+
+def _cached_preview(key, render, media_type="image/jpeg"):
+    # Call under SESSION.lock. Store encoded bytes only, never retain old sessions.
+    if key not in _preview_cache:
+        _preview_cache[key] = render()
+    contents = _preview_cache[key]
+    _preview_cache.move_to_end(key)
+    while len(_preview_cache) > 128 or sum(map(len, _preview_cache.values())) > _PREVIEW_BUDGET:
+        _preview_cache.popitem(last=False)
+    return Response(contents, media_type=media_type, headers={"Cache-Control": "no-store"})
 
 
 def _load_rgb(path: str) -> np.ndarray:
@@ -102,10 +114,11 @@ def get_full(img_id: str) -> np.ndarray:
         _require_image(img_id)
         if img_id not in _full_cache:
             _full_cache[img_id] = _load_rgb(SESSION.images[img_id]["path"])
-            while len(_full_cache) > 4:
-                _full_cache.popitem(last=False)
+        img = _full_cache[img_id]
         _full_cache.move_to_end(img_id)
-        return _full_cache[img_id]
+        while len(_full_cache) > 4 or sum(a.nbytes for a in _full_cache.values()) > _FULL_BUDGET:
+            _full_cache.popitem(last=False)
+        return img
 
 
 def _require_image(img_id):
@@ -123,7 +136,9 @@ def _invalidate_images():
     global _sam_current
     _full_cache.clear()
     _img_cache.clear()
+    _preview_cache.clear()
     _sam_current = None
+    _mask_previews.clear()  # Invalid drafts must not keep discarded sessions/history alive.
 
 
 def _record(label, image_id, before):
@@ -147,6 +162,18 @@ def _freshness(r):
     return "current" if same else "stale"
 
 
+def _work_size(w, h):
+    scale = min(1, SAM2_MAX_SIDE / max(w, h))
+    return max(1, int(w * scale)), max(1, int(h * scale))
+
+
+def _cache_work(img_id, work):
+    _img_cache[img_id] = work
+    _img_cache.move_to_end(img_id)
+    while len(_img_cache) > 8 or sum(a.nbytes for a in _img_cache.values()) > 24 * 1024**2:
+        _img_cache.popitem(last=False)
+
+
 def get_work(img_id: str) -> np.ndarray:
     """SAM2/화면용 축소본 (최대 1024px)."""
     with SESSION.lock:
@@ -157,7 +184,8 @@ def get_work(img_id: str) -> np.ndarray:
             if s < 1:
                 full = cv2.resize(full, (max(1, int(w * s)), max(1, int(h * s))),
                                   interpolation=cv2.INTER_AREA)
-            _img_cache[img_id] = full
+            _cache_work(img_id, full)
+        _img_cache.move_to_end(img_id)
         return _img_cache[img_id]
 
 
@@ -225,7 +253,9 @@ def publish(event: str, data: dict) -> None:
 
 _sam = None
 _sam_lock = threading.Lock()
-_sam_current: str | None = None  # 현재 set_image된 이미지 id
+_sam_current: tuple | None = None  # session, image, edit revision, source path
+_sam_features = OrderedDict()
+_SAM_FEATURE_BUDGET = 96 * 1024**2
 
 
 def _get_sam():
@@ -236,12 +266,43 @@ def _get_sam():
     return _sam
 
 
-def _sam_select(img_id: str) -> None:
+def _feature_size(value):
+    if isinstance(value, dict):
+        return sum(_feature_size(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_feature_size(v) for v in value)
+    if hasattr(value, 'numel'):
+        return value.numel() * value.element_size()
+    return getattr(value, 'nbytes', 0)
+
+
+def _remember_sam(key, sam):
+    features = getattr(sam, '_features', None)
+    if features is None:
+        return
+    _sam_features[key] = (features, sam._orig_hw, str(sam.device), _feature_size(features))
+    _sam_features.move_to_end(key)
+    while len(_sam_features) > 4 or sum(v[3] for v in _sam_features.values()) > _SAM_FEATURE_BUDGET:
+        _sam_features.popitem(last=False)
+
+
+def _sam_select(img_id: str, work=None, key=None) -> None:
     global _sam_current
-    if _sam_current != img_id:
+    if key is None:
+        im = _require_image(img_id)
+        key = (SESSION.dir, img_id, im['revision'], im['path'])
+    if _sam_current != key:
         from sam2_mask import sam_set_image
-        sam_set_image(_get_sam(), get_work(img_id))
-        _sam_current = img_id
+        sam = _get_sam()
+        cached = _sam_features.get(key)
+        if cached and cached[2] == str(sam.device):
+            sam._features, sam._orig_hw = cached[:2]
+            sam._is_image_set, sam._is_batch = True, False
+            _sam_features.move_to_end(key)
+        else:
+            sam_set_image(sam, get_work(img_id) if work is None else work, feat_cache=_sam_features)
+            _remember_sam(key, sam)
+        _sam_current = key
 
 
 def _mask_state(img_id: str) -> dict:
@@ -256,8 +317,7 @@ def _project_mask(img_id, part):
         return part
     im = SESSION.images[img_id]
     work = get_work(img_id)
-    full = get_full(img_id)
-    S = _pixel_scale(work.shape[1] / full.shape[1], work.shape[0] / full.shape[0])
+    S = _pixel_scale(work.shape[1] / im['full_w'], work.shape[0] / im['full_h'])
     M = S @ np.asarray(im["G"]) @ np.linalg.inv(part["G"])
     return cv2.warpAffine(part["mask"].astype(np.uint8), M[:2], (work.shape[1], work.shape[0]), flags=cv2.INTER_NEAREST).astype(bool)
 
@@ -266,23 +326,31 @@ def _freeze_mask(img_id, mask):
     if mask is None or isinstance(mask, dict):
         return mask
     im = SESSION.images[img_id]
-    h, w = get_full(img_id).shape[:2]
+    h, w = im['full_h'], im['full_w']
     S = _pixel_scale(mask.shape[1] / w, mask.shape[0] / h)
     return {"mask": mask.copy(), "G": S @ np.asarray(im["G"]), "revision": im["revision"]}
 
 
 def _predict_mask(img_id: str) -> None:
-    from sam2_mask import sam_predict
     st = _mask_state(img_id)
     if not st["points"]:
         st["current"] = None
         return
-    pts = np.array([[p["x"], p["y"]] for p in st["points"]], dtype=np.float32)
-    lbl = np.array([p["label"] for p in st["points"]], dtype=np.int32)
+    im = _require_image(img_id)
+    st['current'] = _infer_mask(img_id, get_work(img_id), st['points'], (SESSION.dir, img_id, im['revision'], im['path']))
+
+
+def _infer_mask(img_id, work, points, key):
+    """Only this compute boundary owns SAM; it never acquires the session lock."""
+    from sam2_mask import sam_predict
+    pts = np.array([[p['x'], p['y']] for p in points], dtype=np.float32)
+    lbl = np.array([p['label'] for p in points], dtype=np.int32)
     with _sam_lock:
-        _sam_select(img_id)
-        masks, scores, _ = sam_predict(_get_sam(), get_work(img_id), pts, lbl)
-    st["current"] = masks[int(np.argmax(scores))].astype(bool)
+        _sam_select(img_id, work, key)
+        sam = _get_sam()
+        masks, scores, _ = sam_predict(sam, work, pts, lbl, feat_cache=_sam_features)
+        _remember_sam(key, sam)
+    return masks[int(np.argmax(scores))].astype(bool)
 
 
 def _union_mask(img_id: str) -> np.ndarray | None:
@@ -299,16 +367,16 @@ def _union_mask(img_id: str) -> np.ndarray | None:
     return (u * 255).astype(np.uint8)
 
 
-def _mask_overlay_png(img_id: str) -> bytes:
-    """현재(노랑) + 확정(파랑) 마스크를 RGBA PNG로."""
-    st = _mask_state(img_id)
+def _mask_overlay_png(img_id: str, state=None) -> bytes:
+    """현재(연두) + 확정(파랑) 마스크를 RGBA PNG로."""
+    st = _mask_state(img_id) if state is None else state
     h, w = get_work(img_id).shape[:2]
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     for m in st["confirmed"]:
         rgba[_project_mask(img_id, m)] = (60, 120, 255, 110)
     if st["current"] is not None:
         cur = _project_mask(img_id, st["current"])
-        rgba[cur] = (255, 210, 40, 130)
+        rgba[cur] = (180, 230, 45, 130)
     ok, buf = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
     return buf.tobytes()
 
@@ -343,20 +411,23 @@ def state() -> dict:
     with SESSION.lock:
         def img_info(i):
             st = SESSION.masks.get(i, {})
-            work, im = get_work(i), SESSION.images[i]
+            im = SESSION.images[i]
+            w, h = _work_size(im['full_w'], im['full_h'])
             return {
                 "id": i, "role": im["role"], "name": im["name"],
-                "w": work.shape[1], "h": work.shape[0],
+                "w": w, "h": h,
                 "full_w": im["full_w"], "full_h": im["full_h"],
                 "source_w": im["source_w"], "source_h": im["source_h"],
                 "revision": im["revision"], "G": im["G"], "edits": im["edits"],
                 "n_objects": len(st.get("confirmed", [])),
                 "has_current": st.get("current") is not None,
-                "mask_ready": _union_mask(i) is not None,
+                "mask_ready": bool(st.get('confirmed')) or st.get('current') is not None,
                 "mask_rev": st.get("rev", 0), "mask_points": st.get("points", []),
                 "result": _result_summary(SESSION.display_result(i)),
             }
         return {"version": APP_VERSION, "images": [img_info(i) for i in SESSION.order],
+                "capabilities": {"anchor_recovery": True, "unmasked_regional_matching": True,
+                                 "adaptive_sliding_windows": True},
                 "fixed": SESSION.fixed_id(), "fixed_id": SESSION.fixed_id(),
                 "revision": SESSION.revision, "running": SESSION.running,
                 "job": snapshot(SESSION.job), "history": SESSION.history.labels(),
@@ -390,6 +461,10 @@ def _result_summary(r: dict | None) -> dict | None:
         "reproj_median": m.get("reproj_median"),
         "rotation_deg": m.get("rotation_deg"), "scale": m.get("scale"),
         "anchor_residuals": m.get("anchor_residuals", []),
+        "reference_groups": m.get("reference_groups", []),
+        "reference_conflict": bool(m.get("reference_conflict")),
+        "validation": m.get("validation"),
+        "regional": m.get("regional"),
         "manual_adjusted": bool(r.get("manual_adjusted")),
         "used_mask": bool(r.get("used_mask")), "job_id": r.get("job_id"),
     }
@@ -405,39 +480,74 @@ def reset() -> dict:
     return {"ok": True}
 
 
+def _import_photo(session, contents, filename):
+    from PIL import Image, ImageOps
+    name = os.path.basename((filename or 'photo.png').replace('\\', '/'))
+    digest = hashlib.sha256(contents).hexdigest()
+    def existing():
+        return next((i for i, im in session.images.items()
+                     if im['name'] == name and im.get('source_digest') == digest), None)
+    with session.lock:
+        duplicate = existing()
+        if duplicate:
+            return duplicate, False
+    with Image.open(io.BytesIO(contents)) as original:
+        fmt = original.format
+        if fmt not in ('JPEG', 'PNG'):
+            raise ValueError('JPEG/PNG 사진을 선택하세요')
+        w, h = original.size
+        orientation = original.getexif().get(274,1)
+        target = _work_size(w,h)
+        if orientation in (5,6,7,8):
+            w, h = h, w
+        original.draft('RGB',target)  # JPEG decoder can reduce before allocating full pixels.
+        original.thumbnail(target,Image.Resampling.BOX)
+        if original.size != target:
+            original = original.resize(target,Image.Resampling.BOX)
+        oriented = ImageOps.exif_transpose(original)
+        work = np.array(oriented.convert('RGB'))
+    img_id = uuid.uuid4().hex
+    path = os.path.join(session.dir, img_id + ('.jpg' if fmt == 'JPEG' else '.png'))
+    with session.lock:
+        if session is not SESSION:
+            raise HTTPException(409, '작업 세션이 바뀌었습니다. 사진을 다시 추가하세요.')
+        _require_idle()
+        duplicate = existing()  # Concurrent imports can finish decoding together.
+        if duplicate:
+            return duplicate, False
+        with open(path, 'wb') as out:
+            out.write(contents)  # Keep source bytes without recompression.
+        session.images[img_id] = {
+            'role': 'moving', 'name': name, 'source_digest': digest,
+            'path': path, 'source_path': path, 'source_w': w, 'source_h': h,
+            'full_w': w, 'full_h': h, 'revision': 0, 'edits': {}, 'G': np.eye(3).tolist(),
+        }
+        _cache_work(img_id, work)
+        session.order.append(img_id)
+        if session.fixed_id() is None:
+            session.set_fixed(img_id)
+        session.revision += 1
+        session.history.redo.clear()
+    return img_id, True
+
+
 @app.post("/api/upload")
 async def upload(files: list[UploadFile] = File(...), role: str | None = None) -> dict:
-    added, rejected = [], []
+    added, rejected, skipped = [], [], []
+    session = SESSION
     for f in files:
         contents = await f.read()
-        with SESSION.lock:
-            _require_idle()
-            img_id = uuid.uuid4().hex
-            path = os.path.join(SESSION.dir, img_id + ".png")
-            try:
-                from PIL import Image, ImageOps
-                original = Image.open(io.BytesIO(contents))
-                if original.format not in ("JPEG", "PNG"):
-                    raise ValueError("JPEG/PNG 사진을 선택하세요")
-                original = ImageOps.exif_transpose(original)
-                rgb = np.array(original.convert("RGB"))
-                Image.fromarray(rgb).save(path, format="PNG")
-            except Exception as e:
-                rejected.append({"name": f.filename, "reason": str(e)})
-                continue
-            SESSION.images[img_id] = {
-                "role": "moving", "name": os.path.basename((f.filename or "photo.png").replace("\\", "/")),
-                "path": path, "source_path": path, "source_w": rgb.shape[1], "source_h": rgb.shape[0],
-                "full_w": rgb.shape[1], "full_h": rgb.shape[0],
-                "revision": 0, "edits": {}, "G": np.eye(3).tolist(),
-            }
-            SESSION.order.append(img_id)
-            if SESSION.fixed_id() is None:
-                SESSION.set_fixed(img_id)
-            SESSION.revision += 1
-            SESSION.history.redo.clear()
-            added.append(img_id)
-    return {"added": added, "ids": added, "rejected": rejected, "fixed_id": SESSION.fixed_id()}
+        try:
+            image_id, is_new = await asyncio.to_thread(_import_photo, session, contents, f.filename)
+            if is_new:
+                added.append(image_id)
+            else:
+                skipped.append({'name': f.filename, 'id': image_id})
+        except HTTPException:
+            raise
+        except Exception as e:
+            rejected.append({'name': f.filename, 'reason': str(e)})
+    return {"added": added, "ids": added, "rejected": rejected, "skipped": skipped, "fixed_id": SESSION.fixed_id()}
 
 
 @app.post("/api/fixed")
@@ -500,21 +610,21 @@ def delete_image(img_id: str) -> dict:
 
 
 @app.get("/api/image/{img_id}")
-def serve_image(img_id: str):
-    if img_id not in SESSION.images:
-        raise HTTPException(404)
-    work = get_work(img_id)
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(work, cv2.COLOR_RGB2BGR),
-                           [cv2.IMWRITE_JPEG_QUALITY, 88])
-    return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
+def serve_image(img_id: str, max_side: int = SAM2_MAX_SIDE):
+    with SESSION.lock:
+        im = _require_image(img_id)
+        max_side = max(1, min(max_side, SAM2_MAX_SIDE))
+        key = (SESSION.dir, "image", img_id, im['path'], max_side)
+        return _cached_preview(key, lambda: _preview_bytes(get_work(img_id), max_side, quality=88))
 
 
 @app.get("/api/mask/{img_id}/overlay")
 def mask_overlay(img_id: str):
-    if img_id not in SESSION.images:
-        raise HTTPException(404)
-    return StreamingResponse(io.BytesIO(_mask_overlay_png(img_id)),
-                             media_type="image/png")
+    with SESSION.lock:
+        _require_image(img_id)
+        # Session revision is monotonic even when undo restores an older mask rev.
+        key = (SESSION.dir, "mask", img_id, SESSION.revision)
+        return _cached_preview(key, lambda: _mask_overlay_png(img_id), "image/png")
 
 
 def _mutate_mask(img_id, action, point=None):
@@ -561,8 +671,12 @@ _mask_previews = OrderedDict()
 def _preview_mask(img_id, points):
     with SESSION.lock:
         _require_idle()
-        _require_image(img_id)
-        h, w = get_work(img_id).shape[:2]
+        session = SESSION
+        im = _require_image(img_id)
+        revision = session.revision
+        key = (session.dir, img_id, im['revision'], im['path'])
+        work = get_work(img_id)
+        h, w = work.shape[:2]
         if not points or len(points) > 100:
             raise HTTPException(422, "미리보기 점은 1~100개를 사용할 수 있습니다")
         for p in points:
@@ -572,27 +686,23 @@ def _preview_mask(img_id, points):
                 valid = False
             if not valid:
                 raise HTTPException(422, "마스크 점이 사진 범위 밖입니다")
-        original = SESSION.masks.get(img_id)
-        temporary = snapshot(original) if original else {"confirmed": [], "rev": 0}
-        temporary.update(points=points, current=None)
-        SESSION.masks[img_id] = temporary
-        try:
-            _predict_mask(img_id)
-            token = uuid.uuid4().hex
-            frozen = _freeze_mask(img_id, temporary['current'])
-            overlay = base64.b64encode(_mask_overlay_png(img_id)).decode('ascii')
-            _mask_previews[token] = (SESSION, img_id, SESSION.revision, frozen)
-            while len(_mask_previews) > 8:
-                _mask_previews.popitem(last=False)
-            return {"token": token, "overlay": "data:image/png;base64," + overlay}
-        except Exception as exc:
-            log.exception("SAM preview failed")
-            raise HTTPException(503, f"마스크 미리보기 실패: {type(exc).__name__}: {exc}. 최초 실행 시 모델 다운로드에 인터넷이 필요합니다. 대응점 A는 마스크 없이 사용할 수 있습니다.") from exc
-        finally:
-            if original is None:
-                SESSION.masks.pop(img_id, None)
-            else:
-                SESSION.masks[img_id] = original
+    try:
+        mask = _infer_mask(img_id, work, points, key)
+    except Exception as exc:
+        log.exception('SAM preview failed')
+        raise HTTPException(503, f'마스크 미리보기 실패: {type(exc).__name__}: {exc}. 최초 실행 시 모델 다운로드에 인터넷이 필요합니다.') from exc
+    with session.lock:
+        if session is not SESSION or revision != session.revision:
+            raise HTTPException(409, '사진이나 작업 상태가 바뀌었습니다. 다시 클릭하세요.')
+        _require_idle()
+        st = dict(_mask_state(img_id), current=mask)
+        token = uuid.uuid4().hex
+        frozen = _freeze_mask(img_id, mask)
+        overlay = base64.b64encode(_mask_overlay_png(img_id, st)).decode('ascii')
+        _mask_previews[token] = (session, img_id, revision, frozen)
+        while len(_mask_previews) > 8:
+            _mask_previews.popitem(last=False)
+        return {'token': token, 'overlay': 'data:image/png;base64,' + overlay}
 
 
 @app.post("/api/mask/{img_id}/preview")
@@ -637,7 +747,8 @@ def _project_point(img_id, point):
 
 def _point_visible(img_id, point):
     p = _project_point(img_id, point)
-    h, w = get_full(img_id).shape[:2]
+    im = _require_image(img_id)
+    h, w = im['full_h'], im['full_w']
     return bool(0 <= p[0] < w and 0 <= p[1] < h)
 
 
@@ -653,12 +764,16 @@ def get_anchors(mid: str):
 
 
 @app.put("/api/anchors/{mid}")
-def put_anchors(mid: str, pairs: list[dict] = Body(embed=True), base_revision: int = Body(embed=True), fixed_id: str = Body(embed=True)):
+def put_anchors(mid: str, pairs: list[dict] = Body(embed=True), base_revision: int = Body(embed=True), fixed_id: str = Body(embed=True), input_token: str | None = Body(default=None, embed=True)):
     with SESSION.lock:
         _require_idle()
         st = _anchor_state(mid)
         if fixed_id != SESSION.fixed_id() or base_revision != st["revision"]:
             raise HTTPException(409, "앵커 상태가 변경됐습니다. 다시 선택하세요")
+        if input_token is not None and input_token != _recommend_token(mid):
+            raise HTTPException(409, "사진 또는 마스크가 바뀌었습니다. 앵커를 다시 추천받으세요.")
+        if len(pairs) > 100:
+            raise HTTPException(422, "앵커는 100쌍까지 사용할 수 있습니다")
         ids = set()
         for p in pairs:
             if not isinstance(p.get("id"), str) or not p["id"] or p["id"] in ids:
@@ -677,10 +792,87 @@ def put_anchors(mid: str, pairs: list[dict] = Body(embed=True), base_revision: i
                     raise HTTPException(422, "앵커가 원본 사진 범위 밖입니다")
         before = SESSION.snapshot()
         st["pairs"] = [{"id": p["id"], "fixed": p["fixed"], "moving": p["moving"],
-                        "enabled": bool(p.get("requested_enabled", p.get("enabled", True)))} for p in pairs]
+                        "enabled": bool(p.get("requested_enabled", p.get("enabled", True))),
+                        "source": "automatic" if p.get("source") == "automatic" else "manual",
+                        "group": str(p.get("group", "manual"))[:40]} for p in pairs]
         st["revision"] += 1
         _record("앵커 변경", mid, before)
         return get_anchors(mid)
+
+
+def _recommend_token(mid):
+    fid = SESSION.fixed_id()
+    st = _anchor_state(mid)
+    values = [SESSION.dir, fid, mid, st['revision']]
+    for iid in (fid, mid):
+        values += [SESSION.images[iid]['revision'], SESSION.masks.get(iid, {}).get('rev', 0)]
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+
+
+def _recommend_regions(iid):
+    st = _mask_state(iid)
+    parts = list(st['confirmed'])
+    if st['current'] is not None:
+        parts.append(st['current'])
+    if not parts:
+        return []
+    # Stored selections retain the frame in which they were drawn. Bring each
+    # to the current image frame before combining (including edited photos).
+    union = np.zeros(get_work(iid).shape[:2], dtype=bool)
+    for part in parts:
+        union |= _project_mask(iid, part)
+    return [union]
+
+
+@app.post('/api/anchors/{mid}/recommend')
+def suggest_anchors(mid: str, fixed_id: str = Body(embed=True)):
+    session = SESSION
+    with session.lock:
+        _require_idle()
+        if fixed_id != session.fixed_id():
+            raise HTTPException(409, '기준 사진이 바뀌었습니다. 다시 시도하세요.')
+        token = _recommend_token(mid)
+        if token in _recommend_cache:
+            _recommend_cache.move_to_end(token)
+            return _recommend_cache[token]
+        regions = [_recommend_regions(i) for i in (fixed_id, mid)]
+        if not all(regions):
+            raise HTTPException(422, '기준 사진과 현재 사진에서 구조물을 마스크로 선택하고 Z로 확정하세요.')
+        images = [get_work(i) for i in (fixed_id, mid)]
+        # Each work image may have slightly different x/y sampling due to rounding.
+        frames = [np.linalg.inv(_pixel_scale(im.shape[1]/session.images[i]['full_w'],
+                     im.shape[0]/session.images[i]['full_h']) @ np.asarray(session.images[i]['G']))
+                  for i, im in zip((fixed_id, mid), images)]
+        revision = _anchor_state(mid)['revision']
+        if not _recommend_lock.acquire(blocking=False):
+            raise HTTPException(409, '다른 앵커 추천이 진행 중입니다. 잠시 뒤 다시 시도하세요.')
+    try:
+        # SAM and recommendation inference do not run on the device concurrently.
+        with _sam_lock:
+            suggestions, missing = recommend_anchors(*images, *regions)
+        pairs = []
+        for p in suggestions:
+            points = [(frame @ np.array([*p[side], 1.]))[:2].tolist()
+                      for frame, side in zip(frames, ('fixed', 'moving'))]
+            pairs.append({'id': 'auto-' + uuid.uuid4().hex, 'fixed': points[0], 'moving': points[1],
+                          'enabled': True, 'source': 'automatic', 'group': p['group']})
+        with session.lock:
+            if SESSION is not session or fixed_id != session.fixed_id() or mid not in session.images or token != _recommend_token(mid):
+                raise HTTPException(409, '사진 또는 마스크가 바뀌었습니다. 앵커를 다시 추천받으세요.')
+            response = {'pairs': pairs, 'missing': missing, 'token': token,
+                        'fixed_id': fixed_id, 'revision': revision}
+            _recommend_cache[token] = response
+            while len(_recommend_cache) > 4:
+                _recommend_cache.popitem(last=False)
+            return response
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception as exc:
+        raise HTTPException(503, f'앵커를 추천하지 못했습니다. {exc}')
+    finally:
+        _recommend_lock.release()
 
 
 def _png_response(rgb):
@@ -693,17 +885,42 @@ def _png_response(rgb):
 @app.get("/api/image/{img_id}/source")
 def image_source(img_id: str):
     im = _require_image(img_id)
-    return _png_response(_load_rgb(im["source_path"]))
+    media = 'image/png' if im['source_path'].lower().endswith('.png') else 'image/jpeg'
+    return FileResponse(im['source_path'], media_type=media, headers={'Cache-Control':'private, max-age=3600'})
 
 
-def _region(img, x, y, width, height):
+@app.get("/api/image/{img_id}/source-preview")
+def image_source_preview(img_id: str):
+    from PIL import Image, ImageOps
+    with SESSION.lock:
+        im = _require_image(img_id)
+        key = (SESSION.dir, 'source-preview', im['source_path'])
+        def render():
+            with Image.open(im['source_path']) as original:
+                original.draft('RGB',(1600,1600))
+                preview = ImageOps.exif_transpose(original)
+                preview.thumbnail((1600,1600),Image.Resampling.BILINEAR)
+                encoded = io.BytesIO()
+                preview.convert('RGB').save(encoded,format='JPEG',quality=94)
+                return encoded.getvalue()
+        response = _cached_preview(key,render,'image/jpeg')
+        response.headers['X-Source-Width'] = str(im['source_w'])
+        response.headers['X-Source-Height'] = str(im['source_h'])
+        return response
+
+
+def _crop_region(img, x, y, width, height):
     if width < 1 or height < 1 or width > 2048 or height > 2048:
         raise HTTPException(422, "확대 영역 크기는 1~2048 픽셀입니다")
     h, w = img.shape[:2]
     x0, y0, x1, y1 = max(0, x), max(0, y), min(w, x + width), min(h, y + height)
     if x1 <= x0 or y1 <= y0:
         raise HTTPException(422, "확대 영역이 사진 밖입니다")
-    return _png_response(img[y0:y1, x0:x1])
+    return img[y0:y1, x0:x1]
+
+
+def _region(img, x, y, width, height):
+    return _png_response(_crop_region(img, x, y, width, height))
 
 
 @app.get("/api/image/{img_id}/region")
@@ -740,15 +957,17 @@ async def edit_image(img_id: str, image: UploadFile = File(...), metadata: str =
         st = _mask_state(img_id)
         st["current"] = _freeze_mask(img_id, st["current"])
         st["confirmed"] = [_freeze_mask(img_id, p) for p in st["confirmed"]]
-        old_h, old_w = get_full(img_id).shape[:2]
+        old_h, old_w = im['full_h'], im['full_w']
         work_h, work_w = get_work(img_id).shape[:2]
         source_from_work = np.linalg.inv(np.asarray(im["G"])) @ _pixel_scale(old_w / work_w, old_h / work_h)
         source_points = [(source_from_work @ np.array([p["x"], p["y"], 1]), p["label"]) for p in st["points"]]
         path = os.path.join(SESSION.dir, f"{img_id}-{uuid.uuid4().hex}.png")
-        Image.fromarray(rgb).save(path, format="PNG")
+        with open(path,'wb') as out:
+            out.write(contents)  # Validated PNG bytes need no second full-size compression.
         im.update(path=path, revision=SESSION.revision + 1, G=G.tolist(), edits=meta["edits"],
                   full_w=rgb.shape[1], full_h=rgb.shape[0])
         _invalidate_images()
+        _cache_work(img_id, cv2.resize(rgb, _work_size(rgb.shape[1],rgb.shape[0]), interpolation=cv2.INTER_AREA))
         nh, nw = get_work(img_id).shape[:2]
         to_work = _pixel_scale(nw / rgb.shape[1], nh / rgb.shape[0]) @ G
         st["points"] = []
@@ -798,16 +1017,23 @@ def _run_registration(lazy: bool, profile: str, movings: list[str]) -> None:
                 fmask_full = cv2.resize(fmask, (fixed_full.shape[1], fixed_full.shape[0]), interpolation=cv2.INTER_NEAREST)
                 mmask_full = cv2.resize(mmask, (m_full.shape[1], m_full.shape[0]), interpolation=cv2.INTER_NEAREST)
                 anchors = []
+                anchor_groups = []
                 for pair in get_anchors(mid)["pairs"]:
                     if pair.get("enabled", True):
                         anchors.append(tuple(_project_point(fixed_id, pair["fixed"])) + tuple(_project_point(mid, pair["moving"])))
+                        anchor_groups.append(pair.get('group', 'manual') if pair.get('source') == 'automatic' else 'manual:' + pair['id'])
                 def cb(cur, total, label):
                     _job_event(job, "lazy", moving_id=mid, lazy_cur=cur, lazy_total=total, lazy_label=label)
                 fn = register_test_lazy if lazy else register_test
-                kw = {"cfg": cfg, "anchor_points": anchors}
+                pair_cfg = replace(cfg, unmasked_refinement=(cfg.unmasked_refinement
+                                   and fmask_real is None and mmask_real is None))
+                kw = {"cfg": pair_cfg, "anchor_points": anchors}
                 if lazy:
                     kw["progress_callback"] = cb
-                entry = fn(fixed_full, m_full, fmask_full, mmask_full, **kw)[0]
+                if job.get('anchor_only'):
+                    entry = register_anchors(fixed_full, m_full, anchors, anchor_groups)
+                else:
+                    entry = fn(fixed_full, m_full, fmask_full, mmask_full, **kw)[0]
                 if entry.get("M_full") is not None and not is_similarity(entry["M_full"]):
                     raise ValueError("비율을 보존하지 않는 정합 결과를 거절했습니다")
             except Exception as e:
@@ -868,9 +1094,14 @@ def _run_registration(lazy: bool, profile: str, movings: list[str]) -> None:
 @app.post("/api/register")
 def run_register(lazy: bool = Body(default=False, embed=True),
                  profile: str = Body(default="normal", embed=True),
-                 only: list[str] | None = Body(default=None, embed=True)) -> dict:
+                 only: list[str] | None = Body(default=None, embed=True),
+                 anchor_only: bool = Body(default=False, embed=True),
+                 expected_fixed: str | None = Body(default=None, embed=True),
+                 expected_anchor_revision: int | None = Body(default=None, embed=True)) -> dict:
     with SESSION.lock:
         _require_idle()
+        if _recommend_lock.locked():
+            raise HTTPException(409, '앵커 추천이 진행 중입니다. 완료 후 정합하세요.')
         if profile not in PROFILES:
             raise HTTPException(422, "지원하는 프로필은 기본/엄격입니다")
         if not SESSION.fixed_id():
@@ -878,8 +1109,17 @@ def run_register(lazy: bool = Body(default=False, embed=True),
         movings = [m for m in SESSION.moving_ids() if only is None or m in set(only)]
         if not movings:
             raise HTTPException(422, "비교할 사진을 선택하세요")
+        if anchor_only:
+            if len(movings) != 1 or expected_fixed != SESSION.fixed_id():
+                raise HTTPException(409, '현재 사진과 기준 사진을 다시 확인하세요.')
+            st = get_anchors(movings[0])
+            if expected_anchor_revision != st['revision']:
+                raise HTTPException(409, '앵커가 바뀌었습니다. 다시 확인하세요.')
+            if sum(bool(p.get('enabled')) for p in st['pairs']) < 2:
+                raise HTTPException(422, '서로 떨어진 앵커를 2쌍 이상 지정하세요.')
         job_id = uuid.uuid4().hex
         SESSION.job = {"job_id": job_id, "target_ids": movings.copy(), "fixed_id": SESSION.fixed_id(),
+                       "anchor_only": anchor_only,
                        "done": 0, "total": len(movings), "state": "running", "stop_requested": False,
                        "cancelled": False, "items": {m: "queued" for m in movings}}
         SESSION.running = True
@@ -904,7 +1144,7 @@ def _result_image(mid: str, kind: str, previous=False) -> np.ndarray:
     if kind == "registered":
         img = r.get("registered_img")
     elif kind == "false_color":
-        img = false_color(r["fixed_img"], r["registered_img"]) if r.get("registered_img") is not None else None
+        img = _display_false_color(r["fixed_img"], r["registered_img"]) if r.get("registered_img") is not None else None
     elif kind == "match_viz":
         img = r.get("match_viz")
     elif kind == "fixed":
@@ -914,6 +1154,15 @@ def _result_image(mid: str, kind: str, previous=False) -> np.ndarray:
     if img is None:
         raise HTTPException(404, r.get("reason") or "이미지 없음")
     return img
+
+
+def _display_false_color(fixed, registered):
+    # Display images are RGB uint8. Do not reinterpret a dark 0/1 crop as 0..1 floats.
+    out = fixed.copy()
+    gray = cv2.cvtColor(registered, cv2.COLOR_RGB2GRAY)
+    out[:, :, 0] = gray
+    out[:, :, 2] = gray
+    return out
 
 
 # /{kind} 보다 반드시 먼저 등록 — FastAPI는 등록 순서로 매칭하므로 뒤에 두면
@@ -926,9 +1175,58 @@ _gpu_state = {"installing": False, "phase": "", "done": 0, "total": 0, "error": 
 @app.get("/api/gpu")
 def gpu_status() -> dict:
     import gpu_setup
+    import compute_device
+    models = {}
+    for name, module, attr in [('매칭', 'matching', '_loftr_model'), ('마스크', 'sam2_mask', '_sam2_predictor')]:
+        model = getattr(sys.modules.get(module), attr, None)
+        if model is not None:
+            model = getattr(model, 'model', model)
+            models[name] = str(next(model.parameters()).device)
     return {"device": _torch_device(), "gpu_name": gpu_setup.gpu_name(),
             "installed": gpu_setup.installed(), "frozen": getattr(sys, "frozen", False),
+            "mode": compute_device.mode(), "accelerator": compute_device.accelerator(),
+            "platform": sys.platform, "models": models,
             **_gpu_state}
+
+
+@app.post('/api/gpu/device')
+def gpu_device(mode: str = Body(embed=True)):
+    global _sam, _sam_current
+    import compute_device
+    import gc
+    import torch
+    with SESSION.lock:
+        _require_idle()
+        if _gpu_state['installing'] or not _recommend_lock.acquire(blocking=False):
+            raise HTTPException(409, '가속 설치 또는 앵커 추천이 끝난 뒤 전환하세요.')
+        try:
+            if not _sam_lock.acquire(blocking=False):
+                raise HTTPException(409, '마스크 계산이 끝난 뒤 전환하세요.')
+            try:
+                try:
+                    compute_device.select(mode)
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc))
+                # Free device-bound singletons; reload from cached weights on next use.
+                _sam, _sam_current = None, None
+                for module, attr in [('matching', '_loftr_model'), ('sam2_mask', '_sam2_predictor')]:
+                    loaded = sys.modules.get(module)
+                    if loaded is not None:
+                        setattr(loaded, attr, None)
+                _sam_features.clear()
+                _recommend_cache.clear()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            finally:
+                _sam_lock.release()
+        finally:
+            _recommend_lock.release()
+    status = gpu_status()
+    publish('gpu', status)
+    return status
 
 
 def _gpu_install_worker() -> None:
@@ -970,8 +1268,20 @@ def gpu_remove() -> dict:
     return {"removed": True}
 
 
+_folder_lock = threading.Lock()
+
+
 @app.post("/api/select_folder")
 def select_folder() -> dict:
+    if not _folder_lock.acquire(blocking=False):
+        raise HTTPException(409, '폴더 선택창이 이미 열려 있습니다. 열린 창을 확인하거나 경로를 직접 입력하세요.')
+    try:
+        return _choose_folder()
+    finally:
+        _folder_lock.release()
+
+
+def _choose_folder() -> dict:
     """저장 폴더 선택 — 로컬 네이티브 대화상자 (Windows: IFileOpenDialog, macOS: osascript)."""
     import subprocess
     try:
@@ -985,10 +1295,15 @@ def select_folder() -> dict:
                                   "folder_dialog.ps1")
             r = subprocess.run(["powershell", "-STA", "-NoProfile", "-ExecutionPolicy",
                                 "Bypass", "-File", script],
-                               capture_output=True, timeout=300)
+                               capture_output=True, timeout=300,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             path = r.stdout.decode("utf-8", "replace").strip()
     except (OSError, subprocess.TimeoutExpired):
         raise HTTPException(500, "폴더 선택 다이얼로그 실패")
+    if r.returncode != 0:
+        if sys.platform == 'darwin' and b'-128' in r.stderr:
+            return {'path': None}
+        raise HTTPException(500, '폴더 선택창을 열지 못했습니다. 폴더 경로를 직접 입력하거나 파일 다운로드를 사용하세요.')
     path = path.splitlines()[-1].strip() if path else ""
     return {"path": path if os.path.isdir(path) else None}
 
@@ -1004,6 +1319,41 @@ def _encode_result_jpg(mid: str) -> tuple[str, bytes]:
     if not ok:
         raise HTTPException(500, "JPEG 인코딩 실패")
     return f"{fixed_name}_R_{mov_name}.jpg", buf.tobytes()
+
+
+@app.post('/api/export')
+def export_results(only: list[str] = Body(embed=True),
+                   expected_fixed_id: str = Body(embed=True),
+                   expected_results: dict[str, str] = Body(embed=True)):
+    import zipfile
+    from urllib.parse import quote
+    with SESSION.lock:
+        if expected_fixed_id != SESSION.fixed_id() or any(
+            (SESSION.display_result(mid) or {}).get('id') != expected_results.get(mid)
+            for mid in only):
+            raise HTTPException(409, '저장할 결과가 바뀌었습니다. 다시 선택해 주세요.')
+        targets = list(dict.fromkeys(only))
+        if not targets or any(mid not in SESSION.moving_ids() or not SESSION.display_result(mid) for mid in targets):
+            raise HTTPException(409, '저장할 정합 결과가 없습니다.')
+        if len(targets) == 1:
+            name, contents = _encode_result_jpg(targets[0])
+            media = 'image/jpeg'
+        else:
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_STORED) as archive:
+                used = set()
+                for mid in targets:
+                    filename, data = _encode_result_jpg(mid)
+                    stem = os.path.splitext(filename)[0]
+                    suffix = 2
+                    while filename in used:
+                        filename = f'{stem}_{suffix}.jpg'; suffix += 1
+                    used.add(filename)
+                    archive.writestr(filename, data)
+            name, contents, media = 'DKP-정합결과.zip', buffer.getvalue(), 'application/zip'
+    return Response(contents, media_type=media, headers={
+        'Content-Disposition': "attachment; filename*=UTF-8''"+quote(name),
+        'Cache-Control':'no-store'})
 
 
 @app.post("/api/save_results")
@@ -1047,21 +1397,45 @@ def result_download(mid: str):
 
 @app.get("/api/result/{mid}/region")
 def result_region(mid: str, kind: str = "registered", x: int = 0, y: int = 0, width: int = 512, height: int = 512):
-    if kind not in ("fixed", "registered"):
-        raise HTTPException(422, "지원하지 않는 확대 이미지")
-    return _region(_result_image(mid, kind), x, y, width, height)
+    return _result_region(mid, kind, x, y, width, height)
 
 
 @app.get("/api/result/{mid}/previous/region")
 def previous_region(mid: str, kind: str = "registered", x: int = 0, y: int = 0, width: int = 512, height: int = 512):
-    if kind not in ("fixed", "registered"):
+    return _result_region(mid, kind, x, y, width, height, previous=True)
+
+
+def _result_region(mid, kind, x, y, width, height, previous=False):
+    if kind not in ("fixed", "registered", "false_color"):
         raise HTTPException(422, "지원하지 않는 확대 이미지")
-    return _region(_result_image(mid, kind, previous=True), x, y, width, height)
+    with SESSION.lock:
+        if kind == "false_color":
+            fixed = _crop_region(_result_image(mid, "fixed", previous), x, y, width, height)
+            registered = _crop_region(_result_image(mid, "registered", previous), x, y, width, height)
+            return _png_response(_display_false_color(fixed, registered))
+        return _region(_result_image(mid, kind, previous), x, y, width, height)
 
 
 @app.get("/api/result/{mid}/previous/{kind}")
 def previous_result_image(mid: str, kind: str, max_side: int = 1600):
-    return _preview_response(_result_image(mid, kind, previous=True), max_side)
+    return _result_preview(mid, kind, max_side, previous=True)
+
+
+@app.post('/api/result/{mid}/restore-previous')
+def restore_previous_result(mid: str, result_id: str = Body(embed=True)):
+    with SESSION.lock:
+        _require_idle()
+        _require_image(mid)
+        current = SESSION.display_result(mid)
+        if not current or current.get('id') != result_id or not current.get('previous'):
+            raise HTTPException(409, '표시 중인 결과가 바뀌었습니다. 다시 확인하세요.')
+        before = SESSION.snapshot()
+        previous = snapshot(current['previous'])
+        previous['previous'] = {k: v for k, v in snapshot(current).items() if k != 'previous'}
+        SESSION.result_pairs.setdefault(previous['fixed_id'], {})[mid] = previous
+        SESSION.displayed_results[mid] = previous['fixed_id']
+        _record('이전 정합 결과 복원', mid, before)
+        return _result_summary(previous)
 
 
 @app.post("/api/result/{mid}/review")
@@ -1082,10 +1456,22 @@ def review_result(mid: str, result_id: str = Body(embed=True), status: str = Bod
 
 @app.get("/api/result/{mid}/{kind}")
 def result_image(mid: str, kind: str, max_side: int = 1600):
-    return _preview_response(_result_image(mid, kind), max_side)
+    return _result_preview(mid, kind, max_side)
 
 
-def _preview_response(img, max_side):
+def _result_preview(mid, kind, max_side, previous=False):
+    with SESSION.lock:
+        r = SESSION.display_result(mid)
+        if previous and r:
+            r = r.get('previous')
+        if not r:
+            raise HTTPException(404, "결과 없음")
+        max_side = max(1, min(max_side, 4096))
+        key = (SESSION.dir, "result", mid, r['id'], kind, max_side)
+        return _cached_preview(key, lambda: _preview_bytes(_result_image(mid, kind, previous), max_side))
+
+
+def _preview_bytes(img, max_side, quality=90):
     h, w = img.shape[:2]
     max_side = max(1, min(max_side, 4096))
     s = max_side / max(h, w)
@@ -1093,8 +1479,10 @@ def _preview_response(img, max_side):
         img = cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))),
                          interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                           [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
+                           [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise HTTPException(500, "미리보기 생성 실패")
+    return buf.tobytes()
 
 
 @app.post("/api/result/{mid}/adjust")

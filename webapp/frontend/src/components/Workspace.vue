@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import PhotoViewport from "./PhotoViewport.vue";
 import {
   api,
@@ -20,34 +20,197 @@ const props = defineProps<{
   mode: ComparisonMode;
   running: boolean;
   revision: number;
+  registrationError?: string;
+  recoveryAvailable: boolean;
 }>();
 const emit = defineEmits<{
   changed: [];
   error: [string];
   "update:tool": [Tool];
+  recover: [{mid: string; fixedId: string; revision: number}];
+  "recovery-busy": [boolean];
 }>();
 const leftPane = ref<InstanceType<typeof PhotoViewport>>(),
   rightPane = ref<InstanceType<typeof PhotoViewport>>();
 const linked = ref(true),
-  loupe = ref(false),
   maskVisible = ref(true),
   opacity = ref(0.65),
   wipe = ref(50),
   busy = ref(false),
-  maskTarget = ref(""),
-  hover = ref<{ x: number; y: number } | null>(null);
+  maskTarget = ref("");
 const pairs = ref<Anchor[]>([]),
   pairRevision = ref(0),
   selectedPair = ref<string | null>(null),
   placing = ref(false),
   pending = ref<Point | null>(null),
-  showAnchors = ref(true);
+  showAnchors = ref(true),
+  anchorsExpanded = ref(false);
+// Tool preference survives navigation; coordinates and saved pairs do not.
+const manualAnchorMode = ref(false);
+const recommendation = ref<{token: string; missing: string[]} | null>(null);
+const recommending = ref(false), guidance = ref(''), guidanceError = ref('');
+const recommendationOwner = ref('');
+const anchorControls = ref<HTMLElement>();
+const comparisonArea = ref<HTMLElement>();
+const inputKey = computed(() => [props.fixed.id, props.fixed.revision, props.fixed.mask_rev,
+  props.current.id, props.current.revision, props.current.mask_rev].join(':'));
+let recommendationSequence = 0;
+const recoveryBlocked = computed(() => props.running || busy.value || recommending.value);
+const hasRecoveryMask = computed(() => !!r.value?.used_mask || props.fixed.mask_ready || props.current.mask_ready);
+const defaultRecovery = computed(() => props.fixed.mask_ready && props.current.mask_ready ? 'recommend' : 'mask');
+const enabledPairs = computed(() => pairs.value.filter(p => p.enabled).length);
+const guidanceText = computed(() => {
+  if (!props.recoveryAvailable) return '실행 중인 서버가 이전 버전입니다. 자동 앵커 기능을 사용하려면 실행 바로가기를 다시 열어 새 버전으로 접속하세요. 현재 작업은 이 창에 유지됩니다.';
+  if (recommending.value) return recommendationOwner.value === inputKey.value
+    ? '합쳐진 마스크 영역에서 대응점을 고르게 찾고 있습니다.' : '다른 사진의 앵커 추천을 마무리하고 있습니다.';
+  if (props.running) return '정합을 계산하고 있습니다. 완료되면 여기서 결과를 확인하세요.';
+  if (guidanceError.value || props.registrationError) return guidanceError.value || props.registrationError;
+  if (guidance.value) return guidance.value;
+  if (manualAnchorMode.value && props.current.id !== props.fixed.id)
+    return '기준 사진의 한 점을 클릭하고 A를 누른 뒤, 현재 사진의 같은 위치를 클릭하고 A를 누르세요.';
+  if (r.value?.latest_attempt_failed && hasResult.value)
+    return '이번 정합은 실패했습니다. 이전 결과를 유지하고 있습니다. 아래 방법으로 보정해 보세요.';
+  if (r.value?.status === 'fail') return '정합 결과를 만들지 못했습니다. 앵커를 지정하거나 마스크를 다시 선택해 보세요.';
+  if (r.value?.reference_conflict) return '선택한 앵커들이 서로 잘 맞지 않습니다. 점의 짝을 확인하거나 마스크를 다시 선택해 보세요.';
+  return '정합 결과가 마음에 들지 않으면 아래 방법으로 보정해 보세요.';
+});
+const guidanceDetail = computed(() => r.value?.latest_attempt_reason || r.value?.reason || '');
+const missingRegions = computed(() => {
+  const missing = recommendation.value?.missing || [];
+  return (['fixed', 'moving'] as const).filter(side => missing.some(item => item.startsWith(side+':')))
+    .map(side => `${side === 'fixed' ? '기준 사진' : '현재 사진'}의 일부 마스크 영역`).join(' · ');
+});
+watch(inputKey, () => {
+  recommendationSequence++;
+  recommendation.value = null;
+  guidance.value = '';
+  guidanceError.value = '';
+  pairs.value = [];
+  void loadAnchors();
+});
+watch(() => props.current.result?.id, () => { guidance.value = ''; guidanceError.value = ''; });
+watch(() => props.tool, t => {
+  if (t !== 'mask' && t !== 'anchor') manualAnchorMode.value = false;
+  if (t === 'compare') guidance.value = '';
+});
+async function openManualAnchors() {
+  if (recoveryBlocked.value) return;
+  const key = inputKey.value;
+  manualAnchorMode.value = true;
+  emit('update:tool', 'mask');
+  anchorsExpanded.value = true;
+  showAnchors.value = true;
+  guidanceError.value = '';
+  guidance.value = '기준 사진의 한 점을 클릭하고 A를 누른 뒤, 현재 사진의 같은 위치를 클릭하고 A를 누르세요.';
+  await loadAnchors();
+  if (key !== inputKey.value) return;
+  await startAnchor();
+  await nextTick();
+  anchorControls.value?.focus({preventScroll: true});
+}
+async function suggestAnchors() {
+  if (!props.recoveryAvailable || recoveryBlocked.value || props.current.id === props.fixed.id) return;
+  const key = inputKey.value, mid = props.current.id, fid = props.fixed.id;
+  const sequence = ++recommendationSequence;
+  recommendationOwner.value = key;
+  recommending.value = true;
+  emit('recovery-busy', true);
+  guidanceError.value = '';
+  clearPreview();
+  placing.value = false;
+  pending.value = null;
+  try {
+    // Do not discard the user's current points or draft until a fresh response arrives.
+    const saved = await api(`/api/anchors/${mid}`);
+    const data = await api(`/api/anchors/${mid}/recommend`, {fixed_id: fid});
+    if (disposed || sequence !== recommendationSequence || key !== inputKey.value) return;
+    if (data.fixed_id !== fid || saved.revision !== data.revision) throw Error('앵커가 바뀌었습니다. 다시 추천받으세요.');
+    manualAnchorMode.value = false;
+    emit('update:tool', 'mask');
+    anchorsExpanded.value = true;
+    showAnchors.value = true;
+    pairs.value = [...saved.pairs.filter((p:Anchor) => p.source !== 'automatic'), ...data.pairs];
+    pairRevision.value = data.revision;
+    recommendation.value = {token: data.token, missing: data.missing};
+    selectedPair.value = null;
+    guidance.value = data.pairs.length
+      ? `추천 앵커 ${data.pairs.length}쌍을 표시했습니다. 같은 위치인지 확인한 뒤 ‘이 점들로 재정합’을 누르세요.`
+      : '신뢰할 대응점을 찾지 못했습니다. 앵커를 직접 찍거나 마스크를 다시 선택해 주세요.';
+    if (data.missing.length && data.pairs.length) guidance.value += ' 일부 마스크 영역은 추천점이 부족합니다.';
+    await nextTick();
+    anchorControls.value?.focus({preventScroll: true});
+    comparisonArea.value?.scrollIntoView({block: 'nearest'});
+  } catch (e:any) {
+    if (!disposed && sequence === recommendationSequence && key === inputKey.value) guidanceError.value = e.message;
+  } finally {
+    recommending.value = false;
+    emit('recovery-busy', false);
+  }
+}
+async function discardRecommendation() {
+  if (recoveryBlocked.value) return;
+  recommendation.value = null;
+  guidance.value = '';
+  guidanceError.value = '';
+  await loadAnchors();
+}
+async function recoverWithAnchors() {
+  if (!props.recoveryAvailable || recoveryBlocked.value || enabledPairs.value < 2) return;
+  const mid = props.current.id, fixedId = props.fixed.id, key = inputKey.value;
+  if (recommendation.value && !await savePairs(pairs.value, true)) return;
+  if (key !== inputKey.value) return;
+  guidance.value = '';
+  emit('recover', {mid, fixedId, revision: pairRevision.value});
+}
+function openRecoveryTool(tool: 'mask' | 'adjust') {
+  if (recoveryBlocked.value) return;
+  manualAnchorMode.value = false;
+  pending.value = null;
+  placing.value = false;
+  guidanceError.value = '';
+  guidance.value = tool === 'mask'
+    ? '기준으로 삼을 구조물을 선택하고 Z로 확정한 뒤 다시 정합하세요.'
+    : '위치·회전·균일 배율을 조절해 맞춰 보세요.';
+  emit('update:tool', tool);
+}
+async function restorePrevious() {
+  if (recoveryBlocked.value || !r.value?.has_previous) return;
+  const key = pairKey.value;
+  busy.value = true;
+  try {
+    await api(`/api/result/${props.current.id}/restore-previous`, {result_id: r.value.id});
+    if (key === pairKey.value) { previous.value = false; guidance.value = '이전 정합 결과로 돌아왔습니다.'; }
+    emit('changed');
+  } catch (e:any) {
+    if (key === pairKey.value) guidanceError.value = e.message;
+  } finally { busy.value = false; }
+}
 const candidate = ref<{which: "left" | "right"; x: number; y: number} | null>(null);
 const preview = ref<{token: string; overlay: string; imageId: string} | null>(null);
 const previewBusy = ref(false);
 let previewSequence = 0;
 let previewPoints: {x:number; y:number; label:number}[] = [];
 let previewImage = "";
+let previewInFlight = false;
+let queuedPreview: {imageId:string; points:typeof previewPoints; sequence:number} | null = null;
+let disposed = false;
+async function drainPreview() {
+  if (previewInFlight || !queuedPreview || disposed) return;
+  const job = queuedPreview;
+  queuedPreview = null;
+  previewInFlight = true;
+  try {
+    const result = await api(`/api/mask/${job.imageId}/preview`, {points:job.points});
+    if (!disposed && job.sequence === previewSequence)
+      preview.value = {...result, imageId:job.imageId};
+  } catch (e:any) {
+    if (!disposed && job.sequence === previewSequence) emit('error', e.message);
+  } finally {
+    previewInFlight = false;
+    if (queuedPreview) void drainPreview();
+    else if (job.sequence === previewSequence) previewBusy.value = false;
+  }
+}
 function clearPreview() {
   previewSequence++;
   candidate.value = null;
@@ -55,6 +218,19 @@ function clearPreview() {
   previewBusy.value = false;
   previewPoints = [];
   previewImage = "";
+  queuedPreview = null;
+}
+onUnmounted(() => { disposed = true; clearPreview(); });
+function toggleAnchors() {
+  anchorsExpanded.value = !anchorsExpanded.value;
+  if (anchorsExpanded.value) void loadAnchors();
+  else { manualAnchorMode.value = false; pending.value = null; placing.value = false; selectedPair.value = null; }
+}
+function maskOverlay(photo: Photo) {
+  if (!isRaw.value || !maskVisible.value) return undefined;
+  if (preview.value?.imageId === photo.id) return preview.value.overlay;
+  if (!photo.mask_ready) return undefined;
+  return `/api/mask/${photo.id}/overlay?v=${photo.revision}&mask=${photo.mask_rev}`;
 }
 function cancelInput() {
   if (!candidate.value && !preview.value && !previewBusy.value && !pending.value) return false;
@@ -115,7 +291,7 @@ const rightWidth = computed(() =>
     isRaw.value ? props.current.full_h : height.value,
   );
 const version = computed(
-  () => `v=${props.revision}&result=${r.value?.id ?? ""}`,
+  () => `result=${shownResult.value?.id ?? ""}`,
 );
 const base = computed(
   () => `/api/result/${props.current.id}${previous.value ? "/previous" : ""}`,
@@ -241,13 +417,11 @@ function fit() {
   leftPane.value?.fit();
   rightPane.value?.fit();
 }
-function actual() {
-  leftPane.value?.actual();
-  rightPane.value?.actual();
-}
 let anchorRequest = 0;
 async function loadAnchors() {
   const token = ++anchorRequest;
+  if (!anchorsExpanded.value) return;
+  if (recommendation.value) return;
   if (props.current.id === props.fixed.id) {
     pairs.value = [];
     return;
@@ -266,9 +440,11 @@ watch(
   [() => props.current.id, () => props.fixed.id],
   () => {
     clearPreview();
-    placing.value = false;
+    placing.value = manualAnchorMode.value && (props.tool === 'mask' || props.tool === 'anchor')
+      && props.current.id !== props.fixed.id;
     pending.value = null;
     selectedPair.value = null;
+    pairs.value = [];
     draggingPairs = null;
     gesture = null;
     maskTarget.value = props.current.id;
@@ -284,7 +460,9 @@ watch(
   },
 );
 async function startAnchor() {
+  if (!anchorsExpanded.value) return;
   if (props.current.id === props.fixed.id) return;
+  manualAnchorMode.value = true;
   emit("update:tool", "mask");
   const pick = candidate.value;
   if (pick) {
@@ -308,28 +486,35 @@ async function startAnchor() {
   placing.value = true;
   selectedPair.value = null;
 }
-async function savePairs(next: Anchor[]) {
+async function savePairs(next: Anchor[], commit = false) {
   if (busy.value || props.running) return false;
+  if (recommendation.value && !commit) { pairs.value = next; return true; }
   busy.value = true;
+  emit('recovery-busy', true);
   const key = pairKey.value,
     mid = props.current.id,
     fid = props.fixed.id,
     rev = pairRevision.value;
   try {
-    await api(
+    const data = await api(
       `/api/anchors/${mid}`,
-      { pairs: next, base_revision: rev, fixed_id: fid },
+      { pairs: next, base_revision: rev, fixed_id: fid, input_token: recommendation.value?.token },
       "PUT",
     );
-    if (key === pairKey.value) await loadAnchors();
+    if (key === pairKey.value) {
+      recommendation.value = null;
+      pairs.value = data.pairs;
+      pairRevision.value = data.revision;
+    }
     emit("changed");
     return key === pairKey.value;
   } catch (e: any) {
-    emit("error", e.message);
+    if (key === pairKey.value) guidanceError.value = e.message;
     if (key === pairKey.value) await loadAnchors();
     return false;
   } finally {
     busy.value = false;
+    emit('recovery-busy', false);
   }
 }
 async function deleteAnchor() {
@@ -363,8 +548,9 @@ async function click(
   if (isRaw.value && props.tool !== "adjust") {
     maskTarget.value = img.id;
     if (p.button !== 2) candidate.value = {which, x:p.x, y:p.y};
-    if (previewImage !== img.id) previewPoints = [];
+    if (previewImage !== img.id) { previewPoints = []; preview.value = null; }
     previewImage = img.id;
+    if (previewPoints.length >= 100) { emit('error', '개체를 Z로 확정한 뒤 다음 영역을 선택하세요.'); return; }
     previewPoints.push({
       x: Math.max(0, Math.min(img.w - 1, ((p.x + .5) * img.w) / img.full_w - .5)),
       y: Math.max(0, Math.min(img.h - 1, ((p.y + .5) * img.h) / img.full_h - .5)),
@@ -372,15 +558,8 @@ async function click(
     });
     const sequence = ++previewSequence;
     previewBusy.value = true;
-    preview.value = null;
-    try {
-      const result = await api(`/api/mask/${img.id}/preview`, {points: [...previewPoints]});
-      if (sequence === previewSequence) preview.value = {...result, imageId: img.id};
-    } catch (e: any) {
-      if (sequence === previewSequence) emit("error", e.message);
-    } finally {
-      if (sequence === previewSequence) previewBusy.value = false;
-    }
+    queuedPreview = {imageId:img.id, points:[...previewPoints], sequence};
+    void drainPreview();
     return;
   }
   if (props.tool !== "anchor" || !placing.value || p.button !== 0) return;
@@ -401,7 +580,7 @@ async function click(
   }
 }
 function points(which: "left" | "right") {
-  if (!isRaw.value || !showAnchors.value) return [];
+  if (!isRaw.value || !anchorsExpanded.value || !showAnchors.value) return [];
   const img = which === "left" ? props.fixed : props.current;
   const list = pairs.value
     .map((a, i) => {
@@ -447,8 +626,8 @@ async function dragAnchor(
   if (!a) return;
   const img = which === "left" ? props.fixed : props.current,
     point = inversePoint(img.G, [
-      Math.max(0, Math.min(img.full_w, p.x)),
-      Math.max(0, Math.min(img.full_h, p.y)),
+      Math.max(0, Math.min(img.full_w - 1, p.x)),
+      Math.max(0, Math.min(img.full_h - 1, p.y)),
     ]);
   if (which === "left") a.fixed = point;
   else a.moving = point;
@@ -459,7 +638,14 @@ async function dragAnchor(
     await savePairs(next);
   }
 }
-async function maskAction(action: "confirm" | "reset") {
+let pendingMaskAction: Promise<void> | null = null;
+function settleMaskAction() { return pendingMaskAction ?? Promise.resolve(); }
+function maskAction(action: "confirm" | "reset") {
+  if (pendingMaskAction) return pendingMaskAction;
+  pendingMaskAction = performMaskAction(action).finally(() => { pendingMaskAction = null; });
+  return pendingMaskAction;
+}
+async function performMaskAction(action: "confirm" | "reset") {
   if (busy.value || props.running) return;
   if (action === "confirm" && previewBusy.value) return;
   const draft = preview.value;
@@ -506,13 +692,15 @@ async function applyAdjust(reset = false) {
     busy.value = false;
   }
 }
-defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, cancelInput });
+defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, cancelInput, settleMaskAction });
 </script>
 <template>
   <section class="workspace-body">
+    <div class="workspace-canvas">
     <div class="context-toolbar" v-if="!isRaw">
       <span>결과 기준: <strong>{{ resultReference }}</strong></span>
       <span v-if="shownResult?.fixed_id !== fixed.id" class="notice">이전 고정 사진과의 결과 · 다시 정합하기 전까지 유지</span>
+      <span v-else-if="r?.freshness !== 'current'" class="subtle">입력 변경 전 결과 · 새 기준을 적용하려면 다시 정합하세요</span>
     </div>
     <div class="context-toolbar" v-if="isRaw && tool !== 'adjust'">
       <span>마스크 대상</span
@@ -542,9 +730,13 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
         max="1"
         step=".05"
       />
-      <span class="subtle">클릭 → A 대응점 / Z 마스크 · 우클릭 제외</span>
+      <span class="subtle">좌클릭 선택 · 우클릭 제외 · Z 확정</span>
     </div>
-    <div class="context-toolbar" v-if="isRaw && tool !== 'adjust'">
+    <div v-if="isRaw && tool !== 'adjust'" class="anchor-disclosure">
+      <button class="anchor-toggle" :aria-expanded="anchorsExpanded" aria-controls="anchor-controls" :aria-label="anchorsExpanded ? '대응점 접기' : '대응점 펼치기'" @click="toggleAnchors">
+        <span aria-hidden="true">{{ anchorsExpanded ? '▾' : '▸' }}</span> 대응점 <span class="subtle">선택 기능</span>
+      </button>
+    <div id="anchor-controls" ref="anchorControls" tabindex="-1" class="context-toolbar" v-show="anchorsExpanded">
       <button
         :disabled="busy || running || current.id === fixed.id"
         @click="startAnchor"
@@ -569,9 +761,10 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
           v-for="(p, i) in pairs"
           :key="p.id"
           :class="{ on: selectedPair === p.id }"
+          :title="p.source === 'automatic' ? '자동 추천 앵커 · 두 사진의 같은 위치인지 확인하세요' : '직접 지정한 앵커'"
           @click="selectedPair = p.id"
         >
-          {{ i + 1 }}{{ p.enabled ? "" : " (제외)" }}
+          {{ i + 1 }}{{ p.source === 'automatic' ? ' 추천' : '' }}{{ p.enabled ? "" : " (제외)" }}
         </button>
       </div>
       <button
@@ -593,6 +786,7 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
       >
         선택점 사용/제외
       </button>
+    </div>
     </div>
     <div
       class="context-toolbar adjustment"
@@ -624,10 +818,11 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
         자동정합 복원</button
       ><span v-if="adjDirty" class="notice">적용 전 · 사진별 임시 보관</span>
     </div>
-    <div class="comparison-area" :class="{ split: side }">
+    <div ref="comparisonArea" class="comparison-area" :class="{ split: side }">
       <PhotoViewport
         v-if="side"
         ref="leftPane"
+        :class="{ 'mask-active': isRaw && maskTarget === fixed.id }"
         :src="leftSrc"
         :width="width"
         :height="height"
@@ -639,19 +834,13 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
         @point="click('left', $event)"
         :points="points('left')"
         @anchor="dragAnchor('left', $event)"
-        :overlay="
-          maskVisible
-            ? preview?.imageId === fixed.id ? preview.overlay : `/api/mask/${fixed.id}/overlay?v=${revision}`
-            : undefined
-        "
+        :overlay="maskOverlay(fixed)"
         :opacity="opacity"
-        :loupe="loupe"
-        :cursor-point="!isRaw && linked ? hover : null"
-        @hover="hover = $event"
       />
       <PhotoViewport
         v-if="side"
         ref="rightPane"
+        :class="{ 'mask-active': isRaw && maskTarget === current.id }"
         :src="rightSrc"
         :width="rightWidth"
         :height="rightHeight"
@@ -663,15 +852,8 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
         @point="click('right', $event)"
         :points="points('right')"
         @anchor="dragAnchor('right', $event)"
-        :overlay="
-          maskVisible
-            ? preview?.imageId === current.id ? preview.overlay : `/api/mask/${current.id}/overlay?v=${revision}`
-            : undefined
-        "
+        :overlay="maskOverlay(current)"
         :opacity="opacity"
-        :loupe="loupe"
-        :cursor-point="!isRaw && linked ? hover : null"
-        @hover="hover = $event"
       />
       <PhotoViewport
         v-else
@@ -715,6 +897,7 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
                 : 1
         "
         :wipe="mode === 'wipe' && tool !== 'adjust' ? wipe : undefined"
+        @update:wipe="wipe = $event"
         :overlay-transform="
           tool === 'adjust'
             ? `translate(${adj.dx}px,${adj.dy}px) rotate(${adj.rot}deg) scale(${adj.scale})`
@@ -722,7 +905,6 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
         "
         :adjustment="tool === 'adjust' && !busy && !running ? adj : undefined"
         @adjust="pointerAdjust"
-        :loupe="loupe"
       />
     </div>
     <div class="viewport-toolbar">
@@ -733,14 +915,14 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
       >
         {{ previous ? "이전 정합 결과 표시 중" : "이전 정합 결과 비교" }}
       </button>
+      <button v-if="previous && recoveryAvailable" :disabled="recoveryBlocked" @click="restorePrevious">이전 결과로 돌아가기</button>
       <label
         ><input type="checkbox" v-model="linked" />{{
           isRaw ? "확대 배율 연결" : "확대·위치 연결"
         }}</label
       ><button @click="fit">화면 맞춤 <kbd>0</kbd></button
-      ><button @click="actual">100%</button
-      ><button :class="{ on: loupe }" @click="loupe = !loupe">부분 확대</button>
-      <label v-if="!isRaw && mode === 'wipe'"
+      >
+      <label v-if="!isRaw && mode === 'wipe' && tool !== 'adjust'"
         >비교 경계<input
           aria-label="와이프 경계"
           type="range"
@@ -757,8 +939,36 @@ defineExpose({ startAnchor, deleteAnchor, cancel, maskAction, fit, draftUndo, ca
           v-model.number="opacity"
       /></label>
       <span class="spacer" /><span class="subtle">{{
-        previewBusy ? "마스크 미리보기 생성 중… 첫 사용은 모델 다운로드가 필요합니다. A 선택 가능" : busy ? "처리 중…" : "휠 확대 · Space+드래그 이동"
+        previewBusy ? "마스크 계산 중… 추가 클릭은 최신 선택으로 모아 처리합니다" : busy ? "처리 중…" : "휠 확대 · Space+드래그 이동"
       }}</span>
     </div>
+    </div>
+    <section v-if="current.id !== fixed.id" class="registration-guidance" aria-labelledby="registration-guidance-title">
+      <div class="guidance-heading">
+        <strong id="registration-guidance-title">정합 안내</strong>
+        <span v-if="recommendation" class="guidance-tag">추천점 검토 중 · 아직 적용하지 않음</span>
+        <span v-else-if="r?.validation === 'fit_only'" class="subtle">앵커 적합 오차 · 독립 검증 아님</span>
+        <span class="spacer" />
+        <button v-if="anchorsExpanded && isRaw" class="primary" :disabled="!recoveryAvailable || recoveryBlocked || enabledPairs < 2" @click="recoverWithAnchors">이 점들로 재정합</button>
+        <button v-if="recommendation" :disabled="recoveryBlocked" @click="discardRecommendation">추천 취소</button>
+      </div>
+      <p role="status" aria-live="polite" aria-atomic="true" :class="{'guidance-error': guidanceError || registrationError}">{{ guidanceText }}</p>
+      <p v-if="missingRegions" class="subtle">추천점 부족: {{ missingRegions }}</p>
+      <div class="recovery-actions">
+        <button :class="{recommended: defaultRecovery === 'mask'}" :disabled="recoveryBlocked" aria-describedby="mask-help" @click="openRecoveryTool('mask')">{{ hasRecoveryMask ? '마스크 재선택' : '마스크 선택' }}</button>
+        <button :class="{recommended: defaultRecovery === 'recommend'}" :disabled="!recoveryAvailable || recoveryBlocked" aria-describedby="recommend-help" @click="suggestAnchors">앵커 자동 추천</button>
+        <button :disabled="recoveryBlocked" aria-describedby="manual-help" @click="openManualAnchors">앵커 직접 찍기</button>
+        <button :disabled="recoveryBlocked || !hasResult" aria-describedby="adjust-help" @click="openRecoveryTool('adjust')">미세조정</button>
+      </div>
+      <div class="recovery-help">
+        <span id="recommend-help" :class="{'default-help': defaultRecovery === 'recommend'}">여러 번 선택한 마스크를 모두 합쳐, 그 안에서 대응점을 고르게 추천합니다. 점을 확인한 뒤 다시 정합하세요.</span>
+        <span id="manual-help">두 사진에서 같은 위치를 직접 짚어 정합 기준을 지정하세요.</span>
+        <span id="mask-help" :class="{'default-help': defaultRecovery === 'mask'}">{{ hasRecoveryMask ? '기준으로 삼을 영역을 다시 선택한 뒤 정합하세요. 기존 마스크는 유지됩니다.' : '두 사진에서 기준으로 삼을 영역을 선택하고 Z로 확정한 뒤 정합하세요.' }}</span>
+        <span id="adjust-help">{{ hasResult ? '위치·회전·균일 배율을 조금씩 조절하세요.' : '미세조정은 정합 결과가 있어야 사용할 수 있습니다.' }}</span>
+      </div>
+      <details v-if="guidanceDetail && !recommending && !running" class="guidance-detail">
+        <summary>결과 설명</summary><p>{{ guidanceDetail }}</p>
+      </details>
+    </section>
   </section>
 </template>

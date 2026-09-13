@@ -23,13 +23,8 @@ def _get_loftr_model(pretrained: str = 'indoor_new') -> KF.LoFTR:
         except Exception:
             _loftr_model = KF.LoFTR(pretrained='indoor')
         _loftr_model.eval()
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif getattr(torch.backends, "mps", None) is not None \
-                and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        from compute_device import current
+        device = current()
         _loftr_model = _loftr_model.to(device)
     return _loftr_model
 
