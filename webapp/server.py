@@ -493,8 +493,10 @@ def _import_photo(session, contents, filename):
             return duplicate, False
     with Image.open(io.BytesIO(contents)) as original:
         fmt = original.format
+        if fmt == 'MPO':
+            fmt = 'JPEG'  # Camera JPEGs with an MPF segment; first frame is a plain JPEG.
         if fmt not in ('JPEG', 'PNG'):
-            raise ValueError('JPEG/PNG 사진을 선택하세요')
+            raise ValueError(f'JPEG/PNG 사진을 선택하세요 ({fmt or "알 수 없는"} 형식)')
         w, h = original.size
         orientation = original.getexif().get(274,1)
         target = _work_size(w,h)

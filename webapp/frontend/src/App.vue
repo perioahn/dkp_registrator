@@ -329,7 +329,7 @@ async function upload(files: FileList | File[] | null) {
     message.value = `${d.ids?.length ?? files.length}장 추가 · 기준: ${fixed.value?.name ?? ""}`;
     if (d.skipped?.length) message.value += ` · 이미 불러온 사진 ${d.skipped.length}장 건너뜀`;
     if (bad.length)
-      error.value = `제외된 파일: ${bad.map((p: any) => (typeof p === "string" ? p : (p.name ?? p.filename))).join(", ")}`;
+      error.value = `제외된 파일: ${bad.map((p: any) => (typeof p === "string" ? p : `${p.name ?? p.filename}${p.reason ? ` (${p.reason})` : ""}`)).join(", ")}`;
   } catch (e) {
     report(e);
   } finally {
